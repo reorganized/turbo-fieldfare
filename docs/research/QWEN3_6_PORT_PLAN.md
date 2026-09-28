@@ -20,12 +20,12 @@ the changes.
 
 Handoff checklist for an agent working directly on the Mac checkout:
 
-1. Get the changes onto the Mac. Preferred: from instance-c run
-   `git -C /home/opencode/turbo-fieldfare diff > phase1.patch`, scp it over,
-   `git apply --check phase1.patch && git apply phase1.patch` (requires the
-   Mac checkout to be at the same commit, `37fd33f`; if not, port the edits
-   by hand from the checklist below). Alternatively commit the tree on
-   instance-c and fetch.
+1. Get the changes onto the Mac. The Phase 1 work is committed on
+   instance-c as `8322796` ("Add Qwen3.6-35B-A3B repack source and manifest
+   arch fields (Phase 1)", parent `37fd33f`). Preferred: fetch/apply that
+   commit (it contains the research docs too). Fallback: the same changes as
+   a patch via `git diff 37fd33f..8322796`. The Mac checkout must be at
+   `37fd33f`; if not, port the edits by hand from the checklist below.
 2. `swift build` — expect success; report any compile errors verbatim.
 3. `Scripts/test.sh` — the existing suite must stay green (all changes are
    additive; Gemma behavior is untouched by design).
