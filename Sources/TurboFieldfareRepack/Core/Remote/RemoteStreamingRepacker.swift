@@ -583,6 +583,12 @@ public final class RemoteStreamingRepacker {
             if e.name.hasSuffix(".mlp.gate_proj.weight"), let s = e.quantSpec {
                 bits.sharedExpert = s.bits
             }
+            if e.name.hasSuffix(".mlp.gate.weight"), let s = e.quantSpec {
+                bits.router = s.bits
+            }
+            if e.name.hasSuffix(".mlp.shared_expert.gate_proj.weight"), let s = e.quantSpec {
+                bits.sharedExpert = s.bits
+            }
         }
         if let layer = plan.layers.first(where: { !$0.subTensors.isEmpty }),
            let routedBits = layer.subTensors.first?.bitsForWeights {

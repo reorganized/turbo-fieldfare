@@ -3,7 +3,7 @@ import TurboFieldfareRepackCore
 
 private let usage = """
 Usage:
-  TurboFieldfareRepack --output <model.gturbo> [--overwrite] [--resume]
+  TurboFieldfareRepack --output <model.gturbo> [--source <id>] [--overwrite] [--resume]
   TurboFieldfareRepack --discard-partial --output <model.gturbo>
   TurboFieldfareRepack --verify-install --input-gturbo <model.gturbo>
   TurboFieldfareRepack --vision-output <model.vision.gturbo>
@@ -20,10 +20,16 @@ Usage:
                        --vision-output <model.vision.gturbo>
   TurboFieldfareRepack --help
 
-The installer streams the supported Gemma 4 checkpoint from Hugging Face and
-repackages it without materializing the source checkpoint on disk. Set HF_TOKEN
-only if Hugging Face requests authentication. A cancelled or interrupted
-download can be continued with --resume or removed with --discard-partial.
+Sources (--source <id>):
+  gemma4   Gemma 4 26B-A4B IT 4-bit (default; the only source the runtime
+           currently loads)
+  qwen36   Qwen3.6 35B-A3B 4-bit
+
+The installer streams a pinned supported checkpoint from Hugging Face and
+repackages it without materializing the source checkpoint on disk. Set
+HF_TOKEN only if Hugging Face requests authentication. A cancelled or
+interrupted download can be continued with --resume or removed with
+--discard-partial.
 
 The optional image companion pack installs beside an existing text model and
 is bound to it. Without the pack the text runtime is unchanged; image input is
@@ -32,6 +38,7 @@ simply unavailable.
 
 private struct Arguments {
     var output: String?
+    var source: String?
     var overwrite = false
     var resume = false
     var discardPartial = false
@@ -84,12 +91,14 @@ private struct Arguments {
                 }
                 parsed.textModel = values[index + 1]
                 index += 2
-            case "--output", "--input-gturbo":
+            case "--output", "--input-gturbo", "--source":
                 guard index + 1 < values.count else {
                     throw ParseError.missingValue(flag)
                 }
                 if flag == "--output" {
                     parsed.output = values[index + 1]
+                } else if flag == "--source" {
+                    parsed.source = values[index + 1]
                 } else {
                     parsed.inputGTurbo = values[index + 1]
                 }
@@ -123,7 +132,8 @@ private struct Arguments {
                         + "install operations")
             }
             if parsed.removeVisionInstall || parsed.discardPartial {
-                guard parsed.textModel == nil, !parsed.overwrite, !parsed.resume else {
+                guard parsed.textModel == nil, !parsed.overwrite, !parsed.resume,
+                      parsed.source == nil else {
                     throw ParseError.invalidMode(
                         "this vision operation only accepts --vision-output")
                 }
@@ -133,7 +143,7 @@ private struct Arguments {
                 }
                 // Neither reads a download, so a transfer flag here is a
                 // request this mode cannot honour rather than a no-op.
-                guard !parsed.overwrite, !parsed.resume else {
+                guard !parsed.overwrite, !parsed.resume, parsed.source == nil else {
                     throw ParseError.invalidMode(
                         "this vision operation only accepts --vision-output and "
                             + "--text-model")
@@ -155,7 +165,8 @@ private struct Arguments {
             guard parsed.output != nil else {
                 throw ParseError.missingRequired("--output")
             }
-            guard parsed.inputGTurbo == nil, !parsed.overwrite, !parsed.verifyInstall else {
+            guard parsed.inputGTurbo == nil, !parsed.overwrite, !parsed.verifyInstall,
+                  parsed.source == nil else {
                 throw ParseError.invalidMode("--discard-partial only accepts --output")
             }
             return parsed
@@ -164,7 +175,8 @@ private struct Arguments {
             guard parsed.inputGTurbo != nil else {
                 throw ParseError.missingRequired("--input-gturbo")
             }
-            guard parsed.output == nil, !parsed.overwrite, !parsed.resume else {
+            guard parsed.output == nil, !parsed.overwrite, !parsed.resume,
+                  parsed.source == nil else {
                 throw ParseError.invalidMode("verification accepts only --input-gturbo")
             }
         } else {
@@ -174,6 +186,11 @@ private struct Arguments {
             guard parsed.inputGTurbo == nil else {
                 throw ParseError.invalidMode("--input-gturbo requires --verify-install")
             }
+        }
+        if let source = parsed.source, SupportedModelSource.entry(id: source) == nil {
+            let known = SupportedModelSource.all.map { $0.id }.joined(separator: ", ")
+            throw ParseError.invalidMode(
+                "unknown --source \(source); known sources: \(known)")
         }
         return parsed
     }
@@ -322,7 +339,9 @@ private func run(_ values: [String]) async -> Int32 {
     }
 
     guard let output = arguments.output else { return 2 }
-    let options = SupportedModelSource.installOptions(
+    let sourceEntry = arguments.source.flatMap { SupportedModelSource.entry(id: $0) }
+        ?? SupportedModelSource.defaultEntry
+    let options = sourceEntry.installOptions(
         outputDirectory: URL(fileURLWithPath: output),
         overwrite: arguments.overwrite,
         token: ProcessInfo.processInfo.environment["HF_TOKEN"],
@@ -331,7 +350,7 @@ private func run(_ values: [String]) async -> Int32 {
         let progress = InstallProgressReporter()
         let result = try await RemoteStreamingRepacker(options: options).run(
             progress: { progress($0) })
-        print("Installed \(SupportedModelSource.displayName)")
+        print("Installed \(sourceEntry.displayName)")
         print("Source revision: \(result.resolvedCommit)")
         print("Model: \(result.outputDir)")
         return 0

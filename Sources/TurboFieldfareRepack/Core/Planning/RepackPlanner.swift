@@ -215,7 +215,11 @@ enum RepackPlanner {
     }
 
     private static func routedExpertRole(in name: String) -> String? {
-        guard name.contains(".experts.switch_glu.") else { return nil }
+        // Gemma sources stack routed experts under `.experts.switch_glu.`,
+        // Qwen3.6 under `.mlp.switch_mlp.`; both are rank-3
+        // [expert, rows, packed-cols] tensors with identical companion rules.
+        guard name.contains(".experts.switch_glu.")
+                || name.contains(".mlp.switch_mlp.") else { return nil }
         if name.contains(".gate_proj.") { return "gate" }
         if name.contains(".up_proj.")   { return "up" }
         if name.contains(".down_proj.") { return "down" }
@@ -569,6 +573,21 @@ enum RepackPlanner {
         if n.hasSuffix(".post_feedforward_layernorm_1.weight") { return 17 }
         if n.hasSuffix(".post_feedforward_layernorm_2.weight") { return 18 }
         if n.hasSuffix(".layer_scalar")           { return 19 }
+        if n.contains(".linear_attn.in_proj_qkv") { return 20 }
+        if n.contains(".linear_attn.in_proj_z")   { return 21 }
+        if n.contains(".linear_attn.in_proj_a")   { return 22 }
+        if n.contains(".linear_attn.in_proj_b")   { return 23 }
+        if n.contains(".linear_attn.conv1d")      { return 24 }
+        if n.contains(".linear_attn.out_proj")    { return 25 }
+        if n.contains(".linear_attn.A_log")       { return 26 }
+        if n.contains(".linear_attn.dt_bias")     { return 27 }
+        if n.contains(".linear_attn.norm")        { return 28 }
+        if n.contains(".mlp.gate.")               { return 29 }
+        if n.contains(".mlp.shared_expert_gate.") { return 30 }
+        if n.contains(".mlp.shared_expert.gate_proj.weight") { return 31 }
+        if n.contains(".mlp.shared_expert.up_proj.weight")   { return 32 }
+        if n.contains(".mlp.shared_expert.down_proj.weight") { return 33 }
+        if n == "language_model.lm_head.weight"   { return 34 }
         return 100
     }
 }

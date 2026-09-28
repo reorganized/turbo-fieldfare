@@ -25,6 +25,13 @@ public struct ArchConfig: Sendable, Equatable {
     public let attentionKEqV: Bool
     public let fullAttentionLayerMask: [UInt8]
     public let hiddenActivation: String
+    /// Identity of the architecture this configuration describes. The
+    /// manifest records the same value; loaders select the expected
+    /// configuration from it.
+    public let archName: String
+    /// What the mask's 0-valued layers are: `sliding_attention` (Gemma) or
+    /// `linear_attention` (recurrent, no KV).
+    public let nonFullLayerKind: String
     /// The checkpoint's `max_position_embeddings`. The one ceiling every
     /// surface refuses above; not a manifest-compared field, so
     /// `ManifestReader.validateArch` does not read it.
@@ -52,6 +59,8 @@ public struct ArchConfig: Sendable, Equatable {
         attentionKEqV: Bool,
         fullAttentionLayerMask: [UInt8],
         hiddenActivation: String,
+        archName: String = "gemma4-26b-a4b",
+        nonFullLayerKind: String = "sliding_attention",
         maxPositionEmbeddings: Int = 262_144
     ) {
         self.hiddenSize = hiddenSize
@@ -75,6 +84,8 @@ public struct ArchConfig: Sendable, Equatable {
         self.attentionKEqV = attentionKEqV
         self.fullAttentionLayerMask = fullAttentionLayerMask
         self.hiddenActivation = hiddenActivation
+        self.archName = archName
+        self.nonFullLayerKind = nonFullLayerKind
         self.maxPositionEmbeddings = maxPositionEmbeddings
     }
 
@@ -109,6 +120,46 @@ public struct ArchConfig: Sendable, Equatable {
     private static func gemma4LayerMask() -> [UInt8] {
         var mask = [UInt8](repeating: 0, count: 30)
         for i in stride(from: 5, to: 30, by: 6) { mask[i] = 1 }
+        return mask
+    }
+
+    /// Qwen3.6 35B-A3B (Qwen3-Next hybrid). 40 layers: 30 gated-delta-rule
+    /// linear-attention layers and 10 full-attention GQA layers. Every layer
+    /// is MoE (256 experts, top-8, softmax router with renormalization) plus
+    /// one shared expert behind a sigmoid gate. The full-attention layers
+    /// carry a real V projection (no K==V sharing) and fuse an output gate
+    /// into q_proj. Head, embeddings, and rope thetas come from the pinned
+    /// `mlx-community/Qwen3.6-35B-A3B-4bit` checkpoint.
+    public static let qwen3_6_35B_A3B = ArchConfig(
+        hiddenSize: 2048,
+        intermediateSize: 512,
+        moeIntermediateSize: 512,
+        numHeads: 16,
+        numKVHeads: 2,
+        numFullKVHeads: 2,
+        headDim: 256,
+        fullHeadDim: 256,
+        vocabSize: 248_320,
+        slidingWindow: 0,
+        finalLogitSoftcap: 0.0,
+        ropeTheta: 10_000_000.0,
+        fullRopeTheta: 10_000_000.0,
+        partialRotaryFactor: 0.25,
+        numLayers: 40,
+        numExperts: 256,
+        topKExperts: 8,
+        tieWordEmbeddings: false,
+        attentionKEqV: false,
+        fullAttentionLayerMask: Self.qwen36LayerMask(),
+        hiddenActivation: "silu",
+        archName: "qwen3.6-35b-a3b",
+        nonFullLayerKind: "linear_attention",
+        maxPositionEmbeddings: 262_144
+    )
+
+    private static func qwen36LayerMask() -> [UInt8] {
+        var mask = [UInt8](repeating: 0, count: 40)
+        for i in stride(from: 3, to: 40, by: 4) { mask[i] = 1 }
         return mask
     }
 }

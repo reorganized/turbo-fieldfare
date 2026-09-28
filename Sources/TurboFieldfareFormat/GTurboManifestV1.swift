@@ -32,6 +32,15 @@ package struct GTurboManifestArchV1: Codable, Equatable, Sendable {
     package let attentionKEqV: Bool
     package let hiddenActivation: String
     package let fullAttentionLayerMask: [Int]
+    /// Architecture identity. nil on manifests written before the field
+    /// existed; those are Gemma-shaped v1 installs.
+    package let archName: String?
+    /// What the mask's 0-valued layers are: `sliding_attention` (nil means
+    /// this too) or `linear_attention`.
+    package let nonFullLayerKind: String?
+
+    package static let slidingAttentionKind = "sliding_attention"
+    package static let linearAttentionKind = "linear_attention"
 
     package init(hiddenSize: Int, ffnIntermediate: Int, moeIntermediateSize: Int,
                  numHeads: Int, numKVHeads: Int, numFullKVHeads: Int,
@@ -40,7 +49,8 @@ package struct GTurboManifestArchV1: Codable, Equatable, Sendable {
                  ropeTheta: Double, fullRopeTheta: Double,
                  partialRotaryFactor: Double, numLayers: Int, numExperts: Int,
                  topKExperts: Int, tieWordEmbeddings: Bool, attentionKEqV: Bool,
-                 hiddenActivation: String, fullAttentionLayerMask: [Int]) {
+                 hiddenActivation: String, fullAttentionLayerMask: [Int],
+                 archName: String? = nil, nonFullLayerKind: String? = nil) {
         self.hiddenSize = hiddenSize
         self.ffnIntermediate = ffnIntermediate
         self.moeIntermediateSize = moeIntermediateSize
@@ -62,6 +72,8 @@ package struct GTurboManifestArchV1: Codable, Equatable, Sendable {
         self.attentionKEqV = attentionKEqV
         self.hiddenActivation = hiddenActivation
         self.fullAttentionLayerMask = fullAttentionLayerMask
+        self.archName = archName
+        self.nonFullLayerKind = nonFullLayerKind
     }
 }
 
@@ -192,11 +204,31 @@ package enum GTurboManifestCodec {
                 field: "manifest.arch", reason: "dimensions disagree with streaming metadata")
         }
         let arch = manifest.arch
+        switch arch.nonFullLayerKind {
+        case nil, GTurboManifestArchV1.slidingAttentionKind:
+            guard arch.slidingWindow > 0 else {
+                throw GTurboFormatError.invalid(
+                    field: "manifest.arch", reason: "sliding-window architectures require slidingWindow > 0")
+            }
+        case GTurboManifestArchV1.linearAttentionKind:
+            guard arch.slidingWindow >= 0 else {
+                throw GTurboFormatError.invalid(
+                    field: "manifest.arch", reason: "invalid architecture values")
+            }
+        default:
+            throw GTurboFormatError.invalid(
+                field: "manifest.arch.nonFullLayerKind", reason: "unknown non-full-attention layer kind")
+        }
+        if let archName = arch.archName {
+            guard !archName.isEmpty else {
+                throw GTurboFormatError.invalid(field: "manifest.arch.archName", reason: "must not be empty")
+            }
+        }
         guard arch.hiddenSize > 0, arch.ffnIntermediate > 0,
               arch.moeIntermediateSize > 0, arch.numHeads > 0,
               arch.numKVHeads > 0, arch.numFullKVHeads > 0,
               arch.headDim > 0, arch.fullHeadDim > 0,
-              arch.vocabSize > 0, arch.slidingWindow > 0,
+              arch.vocabSize > 0,
               arch.topKExperts > 0, arch.topKExperts <= arch.numExperts,
               arch.finalLogitSoftcap.isFinite,
               arch.ropeTheta.isFinite, arch.ropeTheta > 0,

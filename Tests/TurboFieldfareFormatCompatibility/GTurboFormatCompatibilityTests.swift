@@ -106,7 +106,9 @@ import Testing
             tieWordEmbeddings: config.tieWordEmbeddings,
             attentionKEqV: config.attentionKEqV,
             fullAttentionLayerMask: config.fullAttentionLayerMask,
-            hiddenActivation: config.hiddenActivation)
+            hiddenActivation: config.hiddenActivation,
+            archName: nil,
+            nonFullLayerKind: nil)
         let source = SourceTensor(
             name: "fixture.weight", shardPath: "/dev/null", dtype: .u32,
             shape: [1, 1], absoluteOffset: 0, sizeBytes: 16)
