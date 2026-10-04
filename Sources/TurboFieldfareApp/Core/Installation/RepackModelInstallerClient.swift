@@ -4,6 +4,7 @@ import Synchronization
 
 public final class RepackModelInstallerClient: AppModelInstallerClient, Sendable {
     typealias InstallRunner = @Sendable (
+        AppModelInstallDescriptor,
         URL,
         @escaping @Sendable (ModelInstallProgress) -> Void
     ) async throws -> URL
@@ -25,7 +26,7 @@ public final class RepackModelInstallerClient: AppModelInstallerClient, Sendable
 
     public init(descriptor: AppModelInstallDescriptor = .default) {
         self.descriptor = descriptor
-        self.runInstall = { outputDirectory, progress in
+        self.runInstall = { descriptor, outputDirectory, progress in
             let paths = try RemoteInstallPaths(outputDirectory: outputDirectory.path)
             let resume = FileManager.default.fileExists(atPath: paths.checkpointFile)
             let options = RemoteStreamingRepackOptions(
@@ -54,7 +55,10 @@ public final class RepackModelInstallerClient: AppModelInstallerClient, Sendable
         self.runDiscard = runDiscard
     }
 
-    public func checkInstallRequirement(outputDirectory: URL) throws -> AppModelInstallRequirement {
+    public func checkInstallRequirement(
+        _ descriptor: AppModelInstallDescriptor,
+        outputDirectory: URL
+    ) throws -> AppModelInstallRequirement {
         let saved = try RemoteStreamingRepacker.inspectPersistentInstall(
             outputDirectory: outputDirectory.path,
             repoID: descriptor.repoID,
@@ -87,13 +91,16 @@ public final class RepackModelInstallerClient: AppModelInstallerClient, Sendable
                                           availableBytes: requirement.availableBytes)
     }
 
-    public func installDefaultModel(outputDirectory: URL) -> AsyncThrowingStream<AppModelInstallEvent, Error> {
+    public func install(
+        _ descriptor: AppModelInstallDescriptor,
+        outputDirectory: URL
+    ) -> AsyncThrowingStream<AppModelInstallEvent, Error> {
         AsyncThrowingStream { continuation in
             let id = UUID()
             let task = Task { [runInstall] in
                 do {
                     continuation.yield(.checking)
-                    let completedDirectory = try await runInstall(outputDirectory) { progress in
+                    let completedDirectory = try await runInstall(descriptor, outputDirectory) { progress in
                         continuation.yield(Self.event(for: progress))
                     }
                     try Task.checkCancellation()

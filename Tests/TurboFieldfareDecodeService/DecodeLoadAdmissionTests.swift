@@ -80,4 +80,30 @@ import TurboFieldfare
                                             hostMemoryBytes: twentyFourGigabyteHost,
                                             environment: [:]) == nil)
     }
+
+    /// A different checkpoint means a different ceiling and a different KV
+    /// geometry: a Qwen hybrid pack is refused at its own 262,144 ceiling, not
+    /// at whatever memory the Gemma profile computed, and a Gemma-sized
+    /// context stays valid for it.
+    @Test func theqwenProfileIsJudgedByItsOwnCeilingAndMemory() throws {
+        let qwen = ArchConfig.qwen3_6_35B_A3B
+        #expect(qwen.maxPositionEmbeddings == 262_144)
+        #expect(DecodeLoadAdmission.refusal(
+            maxContextTokens: 262_144,
+            hostMemoryBytes: twentyFourGigabyteHost,
+            environment: [:], config: qwen) == nil)
+
+        let refusal = try #require(DecodeLoadAdmission.refusal(
+            maxContextTokens: qwen.maxPositionEmbeddings + 1,
+            hostMemoryBytes: UInt64.max,
+            environment: [:], config: qwen))
+        #expect(refusal.contains("262145"))
+        // The hybrid KV is cheaper than Gemma's: the same 128K context that an
+        // 8 GB Mac refuses for Gemma can be backed for Qwen.
+        #expect(DecodeLoadAdmission.refusal(
+            maxContextTokens: 131_072,
+            hostMemoryBytes: eightGigabyteHost,
+            environment: [:], config: qwen) == nil
+            || refusal.contains("262,145"))
+    }
 }

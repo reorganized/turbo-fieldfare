@@ -62,6 +62,11 @@ final class Attention {
     private let dPartial: MTLBuffer
     private let oPartial: MTLBuffer
 
+    /// Debug access for differential tests.
+    var mPartialDebug: MTLBuffer { mPartial }
+    var dPartialDebug: MTLBuffer { dPartial }
+    var oPartialDebug: MTLBuffer { oPartial }
+
     init(context: MetalContext) throws {
         self.ctx = context
         self.psoGroupedVecFull = try Self.specializedPipeline(

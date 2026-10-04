@@ -31,6 +31,10 @@ public struct AppGenerationRequest: Equatable, Sendable {
     /// only the service is entitled to make it.
     public var conversationEpoch: UUID?
     public var turnIndex: Int?
+    /// The loaded model's `max_position_embeddings`, set by `AppModel` from
+    /// the manifest-resolved architecture; the default keeps the pinned Gemma
+    /// ceiling for callers that predate the field.
+    public var maxPositionEmbeddings: Int
 
     public init(modelDirectory: URL,
                 prompt: String,
@@ -45,7 +49,9 @@ public struct AppGenerationRequest: Equatable, Sendable {
                 continuesConversation: Bool = false,
                 conversationTokens: Int = 0,
                 conversationEpoch: UUID? = nil,
-                turnIndex: Int? = nil) {
+                turnIndex: Int? = nil,
+                maxPositionEmbeddings: Int = ArchConfig.gemma4_26B_A4B.maxPositionEmbeddings) {
+        self.maxPositionEmbeddings = maxPositionEmbeddings
         self.continuesConversation = continuesConversation
         self.conversationTokens = conversationTokens
         self.conversationEpoch = conversationEpoch
@@ -84,7 +90,7 @@ public struct AppGenerationRequest: Equatable, Sendable {
         // being asked for a position it was never trained to address, which no
         // amount of memory makes valid, so this is refused here rather than
         // discovered as a KV allocation the runtime then throws on.
-        let modelCeiling = ArchConfig.gemma4_26B_A4B.maxPositionEmbeddings
+        let modelCeiling = maxPositionEmbeddings
         guard maxContextTokens <= modelCeiling else {
             throw AppInferenceError.invalidRequest(
                 "Max context \(maxContextTokens) is above the model's "

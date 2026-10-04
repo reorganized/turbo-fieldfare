@@ -9,8 +9,7 @@ public enum AppModelInstallationStatus: Equatable, Sendable {
 
 public enum AppModelInstallationProbe {
     public static func status(
-        at directory: URL,
-        descriptor: AppModelInstallDescriptor = .default
+        at directory: URL
     ) -> AppModelInstallationStatus {
         let directory = directory.standardizedFileURL
         let manifestURL = directory.appendingPathComponent("manifest.json")
@@ -18,11 +17,15 @@ public enum AppModelInstallationProbe {
             return .missing
         }
 
+        // The arch is whatever the manifest records; `expecting` only governs
+        // legacy nil-field manifests, which stay Gemma-only by design. Install
+        // provenance is the verified receipt plus the manifest hash binding,
+        // not a comparison against one descriptor: a pack the descriptor never
+        // knew about is still a complete install if its own receipt checks out.
         do {
             let manifest = try ManifestReader.load(directoryURL: directory, expecting: .gemma4_26B_A4B)
-            let expectedSource = "sha256:" + descriptor.sourceIndexSHA256
-            guard manifest.sourceSnapshotHash == expectedSource else {
-                return .partial("installed checkpoint does not match \(descriptor.displayName)")
+            guard let source = manifest.sourceSnapshotHash, !source.isEmpty else {
+                return .partial("installed manifest carries no source snapshot hash")
             }
             let layout = directory.appendingPathComponent("packed_experts/layout.json")
             guard FileManager.default.fileExists(atPath: layout.path) else {

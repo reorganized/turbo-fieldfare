@@ -64,16 +64,19 @@ public func run(args: Args,
         }
         let tokenizer = try await GFTokenizer.load(forModelDirectory: modelURL)
         var promptIds: [Int32]
+        if let debugIDs = args.promptIDs {
+            // Debug path: literal ids, no rendering, no BOS.
+            promptIds = debugIDs
+        }
         var multimodalMessages: [MultimodalMessage]?
         var imageURLs: [UUID: URL] = [:]
         switch input {
         case .raw(let text):
             multimodalMessages = nil
-            promptIds = tokenizer.encode(text, addBOS: true)
+            promptIds = args.promptIDs ?? tokenizer.encode(text, addBOS: true)
         case .messages(let messages):
             multimodalMessages = nil
-            promptIds = tokenizer.encode(
-                try tokenizer.applyChatTemplate(messages), addBOS: false)
+            promptIds = try tokenizer.encodeChat(messages: messages)
         case .multimodal(let messages, let images):
             multimodalMessages = messages
             imageURLs = images
@@ -130,12 +133,14 @@ public func run(args: Args,
         // Not gated on --quiet, which suppresses the timing footer, not a
         // warning that the run may swap or be killed.
         let hostMemory = ContextAdmission.hostMemoryBytes
+        let admissionConfig = (try? ManifestReader.loadArch(directoryURL: modelURL))
+            ?? ArchConfig.gemma4_26B_A4B
         if case .needsMemory = ContextAdmission.availability(
-            config: ArchConfig.gemma4_26B_A4B,
+            config: admissionConfig,
             maxContext: args.maxContext,
             hostMemoryBytes: hostMemory, expertCacheSlots: runtime.expertCacheSlots) {
             let need = ContextAdmission.needDescription(
-                config: ArchConfig.gemma4_26B_A4B,
+                config: admissionConfig,
                 maxContext: args.maxContext,
                 hostMemoryBytes: hostMemory, expertCacheSlots: runtime.expertCacheSlots)
             stderr.write(Data("[memory: \(need) Continuing.]\n".utf8))
@@ -203,7 +208,8 @@ public func run(args: Args,
             maxContext: args.maxContext,
             runtimeConfiguration: runtime)
         let scratch = try RawCompletionScratch(context: context,
-                                               vocab: model.config.vocabSize)
+                                               vocab: model.config.vocabSize,
+                                               logitSoftcap: Float(model.config.finalLogitSoftcap))
         let multimodalInput: MultimodalPrefillInput?
         if let multimodalMessages {
             let vision = try VisionRuntime.open(

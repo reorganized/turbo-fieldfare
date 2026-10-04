@@ -36,6 +36,14 @@ public struct ArchConfig: Sendable, Equatable {
     /// surface refuses above; not a manifest-compared field, so
     /// `ManifestReader.validateArch` does not read it.
     public let maxPositionEmbeddings: Int
+    /// Gated-delta-rule geometry (0 when the arch has no linear-attention
+    /// layers). Not manifest-compared; the manifest only needs the layer
+    /// mask plus `nonFullLayerKind`.
+    public let linearNumKeyHeads: Int
+    public let linearNumValueHeads: Int
+    public let linearKeyHeadDim: Int
+    public let linearValueHeadDim: Int
+    public let linearConvKernelDim: Int
 
     public init(
         hiddenSize: Int,
@@ -61,7 +69,12 @@ public struct ArchConfig: Sendable, Equatable {
         hiddenActivation: String,
         archName: String = "gemma4-26b-a4b",
         nonFullLayerKind: String = "sliding_attention",
-        maxPositionEmbeddings: Int = 262_144
+        maxPositionEmbeddings: Int = 262_144,
+        linearNumKeyHeads: Int = 0,
+        linearNumValueHeads: Int = 0,
+        linearKeyHeadDim: Int = 0,
+        linearValueHeadDim: Int = 0,
+        linearConvKernelDim: Int = 0
     ) {
         self.hiddenSize = hiddenSize
         self.intermediateSize = intermediateSize
@@ -87,6 +100,32 @@ public struct ArchConfig: Sendable, Equatable {
         self.archName = archName
         self.nonFullLayerKind = nonFullLayerKind
         self.maxPositionEmbeddings = maxPositionEmbeddings
+        self.linearNumKeyHeads = linearNumKeyHeads
+        self.linearNumValueHeads = linearNumValueHeads
+        self.linearKeyHeadDim = linearKeyHeadDim
+        self.linearValueHeadDim = linearValueHeadDim
+        self.linearConvKernelDim = linearConvKernelDim
+    }
+
+    /// True when the mask's 0-valued layers run the gated delta rule instead
+    /// of sliding-window attention.
+    public var usesLinearAttention: Bool {
+        nonFullLayerKind == "linear_attention"
+    }
+
+    /// Attention softmax scale. Gemma 4 uses scale 1.0 (logit softcapping
+    /// replaces the 1/sqrt(d) factor); Qwen3.6 uses the standard
+    /// head_dim^-0.5.
+    public var attentionScale: Float {
+        usesLinearAttention
+            ? Float(1.0 / (Double(headDim).squareRoot()))
+            : 1.0
+    }
+
+    /// Embedding output scale. Gemma 4 multiplies the embedding by
+    /// sqrt(hidden); Qwen3.6 leaves it at 1.0.
+    public var embedOutScale: Float {
+        usesLinearAttention ? 1.0 : Float(hiddenSize).squareRoot()
     }
 
     /// Canonical Gemma 4 26B-A4B baseline, checked against the installed
@@ -154,13 +193,45 @@ public struct ArchConfig: Sendable, Equatable {
         hiddenActivation: "silu",
         archName: "qwen3.6-35b-a3b",
         nonFullLayerKind: "linear_attention",
-        maxPositionEmbeddings: 262_144
+        maxPositionEmbeddings: 262_144,
+        linearNumKeyHeads: 16,
+        linearNumValueHeads: 32,
+        linearKeyHeadDim: 128,
+        linearValueHeadDim: 128,
+        linearConvKernelDim: 4
     )
 
     private static func qwen36LayerMask() -> [UInt8] {
         var mask = [UInt8](repeating: 0, count: 40)
         for i in stride(from: 3, to: 40, by: 4) { mask[i] = 1 }
         return mask
+    }
+
+    /// Resolve the expected configuration from a manifest's
+    /// `arch.archName`. Legacy (nil) manifests keep the caller's default —
+    /// today that is only the Gemma baseline. A recorded name must map to a
+    /// known profile; unknown names fail closed.
+    public static func resolve(manifestArchName: String?,
+                               fallback: ArchConfig) throws -> ArchConfig {
+        guard let name = manifestArchName, !name.isEmpty else { return fallback }
+        switch name {
+        case gemma4_26B_A4B.archName: return gemma4_26B_A4B
+        case qwen3_6_35B_A3B.archName: return qwen3_6_35B_A3B
+        default:
+            throw ModelError.indexCorrupt(
+                detail: "manifest.arch.archName \"\(name)\" has no runtime profile")
+        }
+    }
+}
+
+/// Branch activation for the expert FFNs. Gemma 4 uses tanh-approximate
+/// GELU; Qwen3-Next uses SiLU.
+public enum GatedActivation: Sendable, Equatable {
+    case geluPytorchTanh
+    case silu
+
+    public init(hiddenActivation: String) {
+        self = hiddenActivation == "silu" ? .silu : .geluPytorchTanh
     }
 }
 

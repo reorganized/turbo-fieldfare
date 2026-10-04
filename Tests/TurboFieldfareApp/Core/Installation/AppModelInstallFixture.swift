@@ -3,14 +3,15 @@ import Foundation
 import TurboFieldfare
 @testable import TurboFieldfareAppCore
 
-func makeCompleteModelInstall(_ tag: String) throws -> URL {
+func makeCompleteModelInstall(_ tag: String,
+                              arch: ArchConfig = .gemma4_26B_A4B,
+                              modelID: String = "test/gemma-4-26b-a4b") throws -> URL {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent("turbofieldfare-complete-\(tag)-\(UUID().uuidString).gturbo")
     let experts = directory.appendingPathComponent("packed_experts", isDirectory: true)
     try FileManager.default.createDirectory(at: experts, withIntermediateDirectories: true)
     try Data("{}".utf8).write(to: experts.appendingPathComponent("layout.json"))
 
-    let arch = ArchConfig.gemma4_26B_A4B
     var files: [String: Any] = [
         "model_weights.bin": ["size": 0, "sha256": String(repeating: "0", count: 64)],
         "packed_experts/layout.json": ["size": 2, "sha256": String(repeating: "0", count: 64)],
@@ -26,7 +27,7 @@ func makeCompleteModelInstall(_ tag: String) throws -> URL {
         "versionMajor": 1,
         "versionMinor": 0,
         "flags": ["streamingPresent": true],
-        "modelID": "test/gemma-4-26b-a4b",
+        "modelID": modelID,
         "sourceSnapshotHash": "sha256:" + AppModelInstallDescriptor.default.sourceIndexSHA256,
         "quant": [
             "embedding": quantSlot(4),
@@ -57,6 +58,8 @@ func makeCompleteModelInstall(_ tag: String) throws -> URL {
             "attentionKEqV": arch.attentionKEqV,
             "hiddenActivation": arch.hiddenActivation,
             "fullAttentionLayerMask": arch.fullAttentionLayerMask.map(Int.init),
+            "archName": arch.archName,
+            "nonFullLayerKind": arch.nonFullLayerKind,
         ],
         "files": files,
         "expertsPerLayer": arch.numExperts,

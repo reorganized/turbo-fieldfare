@@ -64,6 +64,7 @@ public enum AccessibilityID: String, CaseIterable, Sendable {
     case bannerModelAction = "banner.model.action"
 
     case installDownload = "install.download"
+    case installModelPicker = "install.modelPicker"
     case installCancel = "install.cancel"
     case installDiscard = "install.discard"
     case installCheckAgain = "install.checkAgain"

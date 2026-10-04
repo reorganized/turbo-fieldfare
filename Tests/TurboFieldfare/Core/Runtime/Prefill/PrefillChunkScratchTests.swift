@@ -119,10 +119,10 @@ import Metal
         let at128 = PrefillChunkScratchLayout(config: .gemma4_26B_A4B, chunkTokens: 128)
         let at256 = PrefillChunkScratchLayout(config: .gemma4_26B_A4B, chunkTokens: 256)
         let perToken = at256.totalPersistentBytes - at128.totalPersistentBytes
-        #expect(at128.totalPersistentBytes == 16_390_528)
-        #expect(at256.totalPersistentBytes == 32_452_992)
-        #expect(perToken == 128 * 125_488)
-        #expect(at128.totalPersistentBytes - 128 * 125_488 == 328_064)
+        #expect(at128.totalPersistentBytes == 17_111_424)
+        #expect(at256.totalPersistentBytes == 33_894_784)
+        #expect(perToken == 128 * 131_120)
+        #expect(at128.totalPersistentBytes - 128 * 131_120 == 328_064)
     }
 
     @Test func multimodalBlockScratchStaysInsideBoundedBudget() {

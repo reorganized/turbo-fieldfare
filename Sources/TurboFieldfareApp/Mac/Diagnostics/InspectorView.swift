@@ -303,7 +303,7 @@ struct InspectorView: View {
                 // would put a row in the menu that every load then refuses.
                 Picker("Context", selection: contextTokensBinding) {
                     ForEach(model.contextOptions) { option in
-                        Text(option.menuLabel).tag(option.tokens)
+                        Text(option.menuLabel(config: model.resolvedArchConfig)).tag(option.tokens)
                     }
                 }
                 .pickerStyle(.menu)

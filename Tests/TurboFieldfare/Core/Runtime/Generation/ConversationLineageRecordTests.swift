@@ -129,4 +129,37 @@ import Testing
             templateIdentity: GFTokenizer.chatTemplateIdentity,
             imageProcessingVersion: VisionImageProcessing.version + 1))
     }
+
+    /// The template identity is what refuses to replay a Qwen conversation
+    /// against the Gemma renderer and vice versa. It follows the manifest's
+    /// chat style: the Qwen family renders through its installed
+    /// `chat_template.jinja`, everything else through the Gemma renderer.
+    @Test func templateIdentityFollowsTheManifestChatStyle() throws {
+        func directoryWithArchName(_ archName: String?) throws -> URL {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("identity-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            var arch: [String: Any] = ["hiddenSize": 1]
+            if let archName { arch["archName"] = archName }
+            try JSONSerialization.data(withJSONObject: ["arch": arch])
+                .write(to: directory.appendingPathComponent("manifest.json"))
+            return directory
+        }
+
+        let gemma = try directoryWithArchName("gemma4-26b-a4b")
+        defer { try? FileManager.default.removeItem(at: gemma) }
+        #expect(ConversationIdentity.templateIdentity(forModelDirectory: gemma)
+            == GFTokenizer.chatTemplateIdentity)
+
+        let legacy = try directoryWithArchName(nil)
+        defer { try? FileManager.default.removeItem(at: legacy) }
+        #expect(ConversationIdentity.templateIdentity(forModelDirectory: legacy)
+            == GFTokenizer.chatTemplateIdentity)
+
+        let qwen = try directoryWithArchName("qwen3.6-35b-a3b")
+        defer { try? FileManager.default.removeItem(at: qwen) }
+        #expect(GFTokenizer.manifestChatStyle(qwen) == .qwenImStart)
+        #expect(ConversationIdentity.templateIdentity(forModelDirectory: qwen)
+            == "qwen3.6-im-jinja-v1")
+    }
 }

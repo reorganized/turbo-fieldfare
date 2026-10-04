@@ -41,16 +41,22 @@ struct GFDetokenizer {
     let skipSpecialTokens: Bool
     private let specialTokenIDs: Set<Int32>
     private let barrierTokenIDs: Set<Int32>
+    /// Qwen-style BPE: decode through the library's ByteLevel decoder, one
+    /// token at a time (each BPE token is a whole byte-level symbol, so the
+    /// per-token decode is position-independent).
+    private let plainDecode: Bool
     /// In-flight byte-fallback run.
     private var run = ByteFallbackRun()
 
     init(tokenizer: GFTokenizer,
          skipSpecialTokens: Bool = true,
-         barrierTokenIDs: Set<Int32> = []) {
+         barrierTokenIDs: Set<Int32> = [],
+         plainDecode: Bool = false) {
         self.tokenizer = tokenizer.tokenizer
         self.skipSpecialTokens = skipSpecialTokens
         self.specialTokenIDs = tokenizer.specialTokenIDs
         self.barrierTokenIDs = barrierTokenIDs
+        self.plainDecode = plainDecode
     }
 
     /// Text contributed by `id`, ready to append to the stream.
@@ -64,6 +70,10 @@ struct GFDetokenizer {
         guard let token = tokenizer.convertIdToToken(Int(id)) else { return "" }
         if skipSpecialTokens, specialTokenIDs.contains(id) {
             return barrierTokenIDs.contains(id) ? run.commit() : ""
+        }
+        if plainDecode {
+            run.commit()
+            return tokenizer.decode(tokens: [Int(id)], skipSpecialTokens: skipSpecialTokens)
         }
         if let byte = GemmaDecoding.byteValue(token) { return run.push(byte) }
         return run.commit() + GemmaDecoding.fragment(token)

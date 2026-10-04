@@ -5,6 +5,7 @@ import SwiftUI
 struct ModelInstallView: View {
     let model: AppModel
     @State private var showingDiscardConfirmation = false
+    @State private var descriptorSelection: AppModelInstallDescriptor = .default
 
     var body: some View {
         ScrollView {
@@ -46,6 +47,16 @@ struct ModelInstallView: View {
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+            if AppModelInstallDescriptor.catalog.count > 1 && !model.isInstallingModel {
+                Picker("Model", selection: $descriptorSelection) {
+                    ForEach(AppModelInstallDescriptor.catalog, id: \.repoID) { descriptor in
+                        Text(descriptor.displayName).tag(descriptor)
+                    }
+                }
+                .pickerStyle(.menu)
+                .fixedSize()
+                .accessibilityIdentifier(.installModelPicker)
+            }
         }
     }
 
@@ -181,7 +192,7 @@ struct ModelInstallView: View {
                 .accessibilityIdentifier(.installCheckAgain)
 
                 Button(model.hasPartialModelDownload ? "Resume" : "Download",
-                       action: model.installModel)
+                       action: { model.installModel(descriptorSelection) })
                     .buttonStyle(.borderedProminent)
                     .disabled(!model.canInstallModel)
                     .accessibilityIdentifier(.installDownload)

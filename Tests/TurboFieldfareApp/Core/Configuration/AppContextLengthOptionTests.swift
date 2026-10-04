@@ -20,14 +20,14 @@ import TurboFieldfare
 
     @Test func optionsReportProductionFP16KVAllocation() {
         let mebibytes = AppContextLengthOption.allCases.map {
-            $0.fp16KVBytes / 1_048_576
+            $0.fp16KVBytes() / 1_048_576
         }
         // 29 MiB above the older figures at every size, because the sliding
         // ring is sized for the widest prefill chunk the runtime may see — the
         // pooled image-token count — and the estimate had used the smaller text
         // chunk. The menu deltas are unchanged: every option grew equally.
         #expect(mebibytes == [334, 414, 574, 894, 1_534, 2_814, 5_374])
-        #expect(AppContextLengthOption.allCases.map(\.menuLabel) == [
+        #expect(AppContextLengthOption.allCases.map { $0.menuLabel() } == [
             "4K, -85 MB",
             "8K, Default",
             "16K, +170 MB",
@@ -43,12 +43,12 @@ import TurboFieldfare
     @Test func everyFigureComesFromTheSharedAdmissionRule() {
         for option in AppContextLengthOption.allCases {
             let config = ArchConfig.gemma4_26B_A4B
-            #expect(option.fp16KVBytes
+            #expect(option.fp16KVBytes()
                 == ContextAdmission.fp16KVBytes(config: config, maxContext: option.tokens))
-            #expect(option.projectedFootprintBytes
+            #expect(option.projectedFootprintBytes()
                 == ContextAdmission.projectedFootprintBytes(config: config,
                                                             maxContext: option.tokens))
-            #expect(option.minimumHostMemoryBytes
+            #expect(option.minimumHostMemoryBytes()
                 == ContextAdmission.minimumHostMemoryBytes(config: config,
                                                            maxContext: option.tokens))
         }
@@ -57,8 +57,7 @@ import TurboFieldfare
     @Test func aneightGigabyteMacIsOfferedEverythingUpTo128K() {
         #expect(AppContextLengthOption.available(on: eightGigabyteHost).map(\.tokens)
             == [4_096, 8_192, 16_384, 32_768, 65_536, 131_072])
-        #expect(AppContextLengthOption.twoFiftySixK.availability(
-            hostMemoryBytes: eightGigabyteHost)
+        #expect(AppContextLengthOption.twoFiftySixK.availability(hostMemoryBytes: eightGigabyteHost)
             == .needsMemory(minimumHostBytes: 11_004_477_440))
         #expect(AppContextLengthOption.largestAvailable(on: eightGigabyteHost)
             == .oneTwentyEightK)
@@ -75,7 +74,7 @@ import TurboFieldfare
     /// disappear from the menu, or an 8 GB Mac whose margin the plan puts at
     /// 270 MB would be offered a context the loader then refuses.
     @Test func themenuBoundaryIsTheAdmissionBoundary() {
-        let minimum = AppContextLengthOption.oneTwentyEightK.minimumHostMemoryBytes
+        let minimum = AppContextLengthOption.oneTwentyEightK.minimumHostMemoryBytes()
         #expect(AppContextLengthOption.available(on: minimum - 1).map(\.tokens)
             == [4_096, 8_192, 16_384, 32_768, 65_536])
         #expect(AppContextLengthOption.available(on: minimum).map(\.tokens)
@@ -104,5 +103,18 @@ import TurboFieldfare
                 .contains(AppContextLengthOption.defaultOption),
                 "the default context was hidden on a \(host)-byte host")
         }
+    }
+
+    /// The same 8 GB Mac that cannot back Gemma's 256K can back Qwen's: the
+    /// hybrid linear-attention KV is far cheaper, so the menu the app shows
+    /// must come from the loaded model's profile, not the Gemma pin.
+    @Test func aqwenPackIsJudgedByItsOwnAdmission() {
+        let qwen = ArchConfig.qwen3_6_35B_A3B
+        let gemmaNeeds = AppContextLengthOption.twoFiftySixK
+            .minimumHostMemoryBytes(config: .gemma4_26B_A4B)
+        #expect(AppContextLengthOption.twoFiftySixK
+            .minimumHostMemoryBytes(config: qwen) < gemmaNeeds)
+        #expect(AppContextLengthOption.twoFiftySixK
+            .availability(hostMemoryBytes: gemmaNeeds, config: qwen) == .available)
     }
 }

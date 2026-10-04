@@ -96,6 +96,8 @@ struct StatusHUDView: View {
                 identifier: .stripNewChat,
                 action: model.newChat)
                 .disabled(!model.canStartNewChat)
+
+            ModelChooserMenu(stripButton: true, model: model)
         }
     }
 
@@ -275,7 +277,7 @@ private struct StripControlButton: View {
 /// that covers the window, so the button that was just pressed faded back in
 /// over the whole slide and read as having disappeared. This says how long a
 /// press takes and refuses the ambient transaction.
-private struct StripControlButtonStyle: ButtonStyle {
+struct StripControlButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .opacity(configuration.isPressed ? 0.45 : 1)

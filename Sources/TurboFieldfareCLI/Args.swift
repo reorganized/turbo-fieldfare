@@ -16,6 +16,9 @@ public struct Args: Equatable, Sendable {
     public var repetitionPenalty: Float
     public var seed: UInt64?
     public var stops: [String]
+    /// Debug escape hatch: literal prompt token ids (comma separated) that
+    /// bypass rendering and BOS entirely.
+    public var promptIDs: [Int32]?
     public var quiet: Bool
     public var expertCacheSlots: Int
     public var expertCachePolicy: RuntimeExpertCachePolicy
@@ -41,6 +44,7 @@ public struct Args: Equatable, Sendable {
                 repetitionPenalty: Float = 1.0,
                 seed: UInt64? = nil,
                 stops: [String] = [],
+                promptIDs: [Int32]? = nil,
                 quiet: Bool = false,
                 expertCacheSlots: Int = RuntimeConfiguration.production.expertCacheSlots,
                 expertCachePolicy: RuntimeExpertCachePolicy = RuntimeConfiguration.production.expertCachePolicy,
@@ -63,6 +67,7 @@ public struct Args: Equatable, Sendable {
         self.repetitionPenalty = repetitionPenalty
         self.seed = seed
         self.stops = stops
+        self.promptIDs = promptIDs
         self.quiet = quiet
         self.expertCacheSlots = expertCacheSlots
         self.expertCachePolicy = expertCachePolicy
@@ -209,6 +214,7 @@ extension Args {
         var repetitionPenalty: Float = 1.0
         var seed: UInt64?
         var stops: [String] = []
+        var promptIDs: [Int32]? = nil
         var quiet = false
         let runtimeDefaults = RuntimeConfiguration.production
         var expertCacheSlots = runtimeDefaults.expertCacheSlots
@@ -261,6 +267,13 @@ extension Args {
                     throw ArgsError.contextExceedsModel(requested: parsed, maximum: ceiling)
                 }
                 maxContext = parsed
+            case "--prompt-ids":
+                let value = try takeValue(argv, &index, flag: flag)
+                let ids = value.split(separator: ",").compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
+                guard !ids.isEmpty else {
+                    throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+                promptIDs = ids
             case "--temperature":
                 let value = try takeValue(argv, &index, flag: flag)
                 guard let parsed = Float(value), parsed >= 0 else {
@@ -388,6 +401,7 @@ extension Args {
                              repetitionPenalty: repetitionPenalty,
                              seed: seed,
                              stops: stops,
+                             promptIDs: promptIDs,
                              quiet: quiet,
                              expertCacheSlots: expertCacheSlots,
                              expertCachePolicy: expertCachePolicy,

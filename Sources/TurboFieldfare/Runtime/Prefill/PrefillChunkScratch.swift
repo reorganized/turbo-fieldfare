@@ -9,6 +9,9 @@ struct PrefillChunkScratchLayout: Sendable, Equatable {
     let routedIntermediate: Int
     let topK: Int
     let routedPairMicrobatchRows: Int
+    let linearAttnConvDim: Int
+    let linearAttnValueDim: Int
+    let linearAttnScalarCount: Int
 
     init(config: ArchConfig,
                 chunkTokens: Int,
@@ -23,8 +26,22 @@ struct PrefillChunkScratchLayout: Sendable, Equatable {
         self.routedIntermediate = config.moeIntermediateSize
         self.topK = config.topKExperts
         self.routedPairMicrobatchRows = max(1, min(routedPairMicrobatchRows, 128))
+        // Qwen3.6 gated-delta-rule scratch (0 when the arch has no linear
+        // layers, so Gemma allocates nothing extra).
+        if config.usesLinearAttention {
+            let nk = config.linearNumKeyHeads
+            let nv = config.linearNumValueHeads
+            let dk = config.linearKeyHeadDim
+            let dv = config.linearValueHeadDim
+            self.linearAttnConvDim = nk * dk * 2 + nv * dv
+            self.linearAttnValueDim = nv * dv
+            self.linearAttnScalarCount = nv
+        } else {
+            self.linearAttnConvDim = 0
+            self.linearAttnValueDim = 0
+            self.linearAttnScalarCount = 0
+        }
     }
-
 
     var hiddenElements: Int { chunkTokens * hiddenSize }
     var normedElements: Int { hiddenElements }
@@ -37,12 +54,21 @@ struct PrefillChunkScratchLayout: Sendable, Equatable {
     var routerXElements: Int { hiddenElements }
     var h1Elements: Int { hiddenElements }
     var h2Elements: Int { hiddenElements }
+    var normed2Elements: Int { hiddenElements }
     var routePartialElements: Int { chunkTokens * topK * hiddenSize }
     var routeIDElements: Int { chunkTokens * topK }
     var routeWeightElements: Int { routeIDElements }
     var sharedExpertScratchElements: Int { sharedIntermediate }
     var routedGateUpActElements: Int { 3 * routedPairMicrobatchRows * routedIntermediate }
     var routedDownOutputElements: Int { routedPairMicrobatchRows * hiddenSize }
+    var qwenQKVElements: Int { chunkTokens * linearAttnConvDim }
+    var qwenZElements: Int { chunkTokens * linearAttnValueDim }
+    var qwenABElements: Int { chunkTokens * linearAttnScalarCount * 2 }
+    var qwenConvOutElements: Int { qwenQKVElements }
+    var qwenConvWindowStageElements: Int {
+        linearAttnConvDim > 0 ? 3 * linearAttnConvDim : 0
+    }
+    var qwenGateLogitElements: Int { chunkTokens }
 
     var devicePrivateBytes: Int {
         let fp16Elements = hiddenElements
@@ -60,6 +86,12 @@ struct PrefillChunkScratchLayout: Sendable, Equatable {
             + 3 * sharedExpertScratchElements
             + routedGateUpActElements
             + routedDownOutputElements
+            + qwenQKVElements
+            + qwenZElements
+            + qwenABElements
+            + qwenConvOutElements
+            + qwenConvWindowStageElements
+            + normed2Elements
         return fp16Elements * MemoryLayout<Float16>.stride
     }
 
@@ -94,6 +126,13 @@ struct PrefillChunkScratchBuffers {
     let sharedActScratch: MTLBuffer
     let routedGateUpActScratch: MTLBuffer
     let routedDownScratch: MTLBuffer
+    let qwenQKV: MTLBuffer
+    let qwenZ: MTLBuffer
+    let qwenAB: MTLBuffer
+    let qwenConvOut: MTLBuffer
+    let qwenConvWindowStage: MTLBuffer
+    let qwenNormed2: MTLBuffer
+    let qwenGateLogits: MTLBuffer
 
     static func allocate(device: MTLDevice,
                          layout: PrefillChunkScratchLayout) throws -> PrefillChunkScratchBuffers {
@@ -144,6 +183,15 @@ struct PrefillChunkScratchBuffers {
             routedGateUpActScratch: try privateBuffer(layout.routedGateUpActElements,
                                                       label: "prefill.routedGateUpActScratch"),
             routedDownScratch: try privateBuffer(layout.routedDownOutputElements,
-                                                 label: "prefill.routedDownScratch"))
+                                                 label: "prefill.routedDownScratch"),
+            qwenQKV: try privateBuffer(layout.qwenQKVElements, label: "prefill.qwenQKV"),
+            qwenZ: try privateBuffer(layout.qwenZElements, label: "prefill.qwenZ"),
+            qwenAB: try privateBuffer(layout.qwenABElements, label: "prefill.qwenAB"),
+            qwenConvOut: try privateBuffer(layout.qwenConvOutElements, label: "prefill.qwenConvOut"),
+            qwenConvWindowStage: try privateBuffer(layout.qwenConvWindowStageElements,
+                                                   label: "prefill.qwenWindowStage"),
+            qwenNormed2: try privateBuffer(layout.normed2Elements, label: "prefill.qwenNormed2"),
+            qwenGateLogits: try privateBuffer(layout.qwenGateLogitElements,
+                                              label: "prefill.qwenGateLogits"))
     }
 }

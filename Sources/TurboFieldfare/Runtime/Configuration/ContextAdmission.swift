@@ -19,9 +19,33 @@ public enum ContextAdmission {
     // owns its slots; the streamer rounds each allocation to the host page size.
     private static let expertStrideBytes = 3_358_720
 
+    /// Per-routed-expert bytes implied by the arch geometry (Qwen3.6: 3 roles
+    /// of [rows, cols/8] U32 + BF16 scales/biases). The pinned Gemma pack's
+    /// stride is the measured constant above; other archs derive from config.
+    private static func derivedExpertStrideBytes(config: ArchConfig) -> Int {
+        func packedRowsBytes(rows: Int, logicalCols: Int, bits: Int) -> Int {
+            let groups = logicalCols / Quantization.groupSize
+            let weightBytes = rows * (logicalCols * bits / 8)
+            let auxBytes = rows * groups * MemoryLayout<UInt16>.size * 2
+            return weightBytes + auxBytes
+        }
+        let gate = packedRowsBytes(rows: config.moeIntermediateSize,
+                                   logicalCols: config.hiddenSize, bits: 4)
+        let down = packedRowsBytes(rows: config.hiddenSize,
+                                   logicalCols: config.moeIntermediateSize, bits: 4)
+        return 2 * gate + down
+    }
+
+    private static func strideBytes(config: ArchConfig) -> Int {
+        config.usesLinearAttention
+            ? derivedExpertStrideBytes(config: config)
+            : expertStrideBytes
+    }
+
     private static func additionalExpertCacheBytes(config: ArchConfig, slots: Int) -> UInt64 {
         let page = Int(getpagesize())
-        let slotBytes = ((expertStrideBytes + page - 1) / page) * page
+        let raw = strideBytes(config: config)
+        let slotBytes = ((raw + page - 1) / page) * page
         // Do not discount the measured baseline for smaller caches: the rest
         // of that allowance has not been measured separately.
         return UInt64(max(0, slots - 16)) * UInt64(config.numLayers) * UInt64(slotBytes)
@@ -50,20 +74,32 @@ public enum ContextAdmission {
         return min(maxContext, config.slidingWindow + chunkRows)
     }
 
-    /// FP16 K and V bytes the runtime allocates for `maxContext`.
-    ///
-    /// Sliding-window layers are ring-capped; only the full-attention layers
-    /// grow with the context, at 20,480 B per token across the five of them.
+    /// FP16 K and V bytes the runtime allocates for `maxContext`, plus the
+    /// delta-rule state of linear-attention layers (fp32 S per layer and the
+    /// conv window — constant, not context-scaled).
     public static func fp16KVBytes(config: ArchConfig, maxContext: Int) -> UInt64 {
         let fullLayers = config.fullAttentionLayerMask.reduce(0) { $0 + ($1 == 0 ? 0 : 1) }
-        let slidingLayers = config.numLayers - fullLayers
+        var slidingLayers = config.numLayers - fullLayers
+        var linearLayers = 0
+        if config.usesLinearAttention {
+            linearLayers = config.numLayers - fullLayers
+            slidingLayers = 0
+        }
         let fp16Bytes = 2
         let keyAndValue = 2
         let slidingRows = productionSlidingRingRows(config: config, maxContext: maxContext)
         let slidingBytesPerRow = config.numKVHeads * config.headDim * keyAndValue * fp16Bytes
         let fullBytesPerRow = config.numFullKVHeads * config.fullHeadDim * keyAndValue * fp16Bytes
+        let linearStateBytes = UInt64(linearLayers) * UInt64(
+            config.linearNumValueHeads * config.linearValueHeadDim
+                * config.linearKeyHeadDim * MemoryLayout<Float32>.size
+                + (config.linearConvKernelDim - 1)
+                * (config.linearNumKeyHeads * config.linearKeyHeadDim * 2
+                   + config.linearNumValueHeads * config.linearValueHeadDim)
+                * fp16Bytes)
         return UInt64(slidingLayers * slidingRows * slidingBytesPerRow)
             + UInt64(fullLayers * maxContext * fullBytesPerRow)
+            + linearStateBytes
     }
 
     /// What the process is expected to occupy at this context.

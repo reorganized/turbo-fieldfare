@@ -43,11 +43,17 @@ final class MockModelInstallerClient: AppModelInstallerClient, Sendable {
         self.delayCancellationAcknowledgement = delayCancellationAcknowledgement
     }
 
-    func checkInstallRequirement(outputDirectory: URL) throws -> AppModelInstallRequirement {
+    func checkInstallRequirement(
+        _ descriptor: AppModelInstallDescriptor,
+        outputDirectory: URL
+    ) throws -> AppModelInstallRequirement {
         requirement
     }
 
-    func installDefaultModel(outputDirectory: URL) -> AsyncThrowingStream<AppModelInstallEvent, Error> {
+    func install(
+        _ descriptor: AppModelInstallDescriptor,
+        outputDirectory: URL
+    ) -> AsyncThrowingStream<AppModelInstallEvent, Error> {
         AsyncThrowingStream { continuation in
             let events = self.events
             let failure = self.failure

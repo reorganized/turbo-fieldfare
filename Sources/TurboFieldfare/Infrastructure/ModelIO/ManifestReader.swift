@@ -28,6 +28,9 @@ public struct ManifestArch: Decodable, Equatable, Sendable {
     public let attentionKEqV: Bool
     public let hiddenActivation: String
     public let fullAttentionLayerMask: [Int]
+    /// Architecture identity; nil on legacy Gemma-shaped manifests.
+    public let archName: String?
+    public let nonFullLayerKind: String?
 }
 
 public struct ManifestQuantSlot: Decodable, Equatable, Sendable {
@@ -64,6 +67,23 @@ public struct Manifest: Decodable, Equatable, Sendable {
 public enum ManifestReader {
     public static let defaultMaxBytes: UInt64 = 4 * 1024 * 1024
 
+    /// Peek at the manifest's architecture and resolve it to the runtime
+    /// profile, without validating the whole manifest. `nil` for legacy
+    /// nil-field manifests (the caller's Gemma default applies). Used by
+    /// front ends that need the arch before `Model.load`.
+    public static func loadArch(directoryURL: URL) throws -> ArchConfig? {
+        let url = directoryURL.appendingPathComponent("manifest.json")
+        let data: Data
+        do {
+            data = try Data(contentsOf: url, options: .mappedIfSafe)
+        } catch {
+            return nil
+        }
+        let wire = try GTurboManifestCodec.decodeUnchecked(data)
+        return try ArchConfig.resolve(manifestArchName: wire.arch.archName,
+                                      fallback: ArchConfig.gemma4_26B_A4B)
+    }
+
     /// Recognized flag keys. Anything else in `manifest.flags` is an error.
     public static let knownFlags: Set<String> = GTurboFormatV1.knownFlags
 
@@ -90,6 +110,7 @@ public enum ManifestReader {
     package static func decode(data: Data,
                                expecting: ArchConfig) throws -> Manifest {
         let manifest: Manifest
+        let resolvedExpecting: ArchConfig
         do {
             let wire = try GTurboManifestCodec.decodeUnchecked(data)
             guard wire.magic == GTurboFormatV1.magic else {
@@ -109,6 +130,10 @@ public enum ManifestReader {
                     pageSize: Int(GTurboFormatV1.alignmentBytes))
             }
             try GTurboManifestCodec.validate(wire)
+            // A recorded archName selects the expected runtime profile; the
+            // caller's `expecting` only governs legacy nil-field manifests.
+            resolvedExpecting = try ArchConfig.resolve(
+                manifestArchName: wire.arch.archName, fallback: expecting)
             manifest = Manifest(wire: wire)
         } catch let error as ModelError {
             throw error
@@ -116,7 +141,7 @@ public enum ManifestReader {
             throw ModelError.indexCorrupt(detail: "manifest.json: \(error)")
         }
 
-        try validate(manifest, against: expecting)
+        try validate(manifest, against: resolvedExpecting)
         return manifest
     }
 
@@ -222,7 +247,9 @@ private extension ManifestArch {
                   tieWordEmbeddings: wire.tieWordEmbeddings,
                   attentionKEqV: wire.attentionKEqV,
                   hiddenActivation: wire.hiddenActivation,
-                  fullAttentionLayerMask: wire.fullAttentionLayerMask)
+                  fullAttentionLayerMask: wire.fullAttentionLayerMask,
+                  archName: wire.archName,
+                  nonFullLayerKind: wire.nonFullLayerKind)
     }
 }
 

@@ -62,7 +62,8 @@ final class MoE {
     private let routedArgEncoder: MTLArgumentEncoder
     private let reusableRoutedArgBuffer: MTLBuffer
 
-    init(context: MetalContext) throws {
+        init(context: MetalContext,
+                activation: GatedActivation = .geluPytorchTanh) throws {
         let routerName = "router_gemv_gemma4_r4"
         self.routerGemvPSO = try context.pipeline(
             routerName,
@@ -76,14 +77,30 @@ final class MoE {
         self.routerSelectK8SpecializedPSO = try context.pipeline(
             "router_topk_select_k8",
             constants: Self.realDecodeRouterConstants)
-        self.phase1U16PSO = try context.pipeline("moe_phase1_gate_up_act_u16load")
+        let siluConstant: MetalFunctionConstant?
+        switch activation {
+        case .geluPytorchTanh: siluConstant = nil
+        case .silu:
+            siluConstant = MetalFunctionConstant(index: 44, value: .bool(true))
+        }
+        let actConstants: [MetalFunctionConstant]
+        if let c = siluConstant {
+            actConstants = Self.realDecodeMoEConstants + [c]
+        } else {
+            actConstants = Self.realDecodeMoEConstants
+        }
+        self.phase1U16PSO = try context.pipeline(
+            "moe_phase1_gate_up_act_u16load",
+            constants: siluConstant.map { [$0] } ?? [])
         self.phase1U16SpecializedPSO = try context.pipeline(
             "moe_phase1_gate_up_act_u16load",
-            constants: Self.realDecodeMoEConstants)
-        self.phase1SubsetU16PSO = try context.pipeline("moe_phase1_gate_up_act_subset_u16load")
+            constants: actConstants)
+        self.phase1SubsetU16PSO = try context.pipeline(
+            "moe_phase1_gate_up_act_subset_u16load",
+            constants: siluConstant.map { [$0] } ?? [])
         self.phase1SubsetU16SpecializedPSO = try context.pipeline(
             "moe_phase1_gate_up_act_subset_u16load",
-            constants: Self.realDecodeMoEConstants)
+            constants: actConstants)
         self.phase2ReduceK8PSO = try context.pipeline("moe_phase2_down_reduce_k8")
         self.phase2ReduceK8SpecializedPSO = try context.pipeline(
             "moe_phase2_down_reduce_k8",

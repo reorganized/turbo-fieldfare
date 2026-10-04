@@ -94,11 +94,16 @@ enum DecodeServiceError: Error, CustomStringConvertible {
                 }
                 do {
                     let options = try appRuntimeOptions(request.runtimeOptions)
+                    // The same manifest read the app makes before the load; a
+                    // manifest that cannot be read keeps the Gemma profile, and
+                    // `ensureLoaded` refuses the directory on its own terms.
+                    let config = (try? ManifestReader.loadArch(directoryURL: directory)) ?? .gemma4_26B_A4B
                     if let refusal = DecodeLoadAdmission.refusal(
                         maxContextTokens: request.maxContextTokens,
                         hostMemoryBytes: ContextAdmission.hostMemoryBytes,
                         environment: ProcessInfo.processInfo.environment,
-                        expertCacheSlots: options.expertCacheSlots) {
+                        expertCacheSlots: options.expertCacheSlots,
+                        config: config) {
                         try? write(DecodeServiceEvent(
                             kind: .failed, generationID: request.requestID, error: refusal),
                             to: handles.output)

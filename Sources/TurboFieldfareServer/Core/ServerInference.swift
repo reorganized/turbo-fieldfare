@@ -562,7 +562,10 @@ public actor ServerModelSession: ServerInferenceBackend {
         guard FileManager.default.fileExists(atPath: templateURL.path) else {
             throw GFTokenizerError.missingToolTemplate
         }
-        let tokenizer = try await GFTokenizer.load(from: tokenizerFolder)
+        let tokenizer = try await GFTokenizer.load(
+            from: tokenizerFolder,
+            chatStyle: GFTokenizer.manifestChatStyle(modelDirectory),
+            vocabSize: GFTokenizer.manifestVocabSize(modelDirectory))
         let context = try MetalContext()
         let runtime = runtimeConfiguration
         let model = try Model.load(

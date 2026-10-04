@@ -1,7 +1,7 @@
 import Foundation
 import TurboFieldfareRepackCore
 
-public struct AppModelInstallDescriptor: Equatable, Sendable {
+public struct AppModelInstallDescriptor: Equatable, Hashable, Sendable {
     public let displayName: String
     public let repoID: String
     public let revision: String
@@ -42,6 +42,22 @@ public struct AppModelInstallDescriptor: Equatable, Sendable {
         installedBytes: 14_291_921_884,
         rangeStagingBytes: UInt64(RemoteChunkPolicy.defaultBytes),
         reserveBytes: 1_073_741_824)
+
+    public static let qwen3_6_35B_A3B = AppModelInstallDescriptor(
+        displayName: "Qwen3.6 35B-A3B 4-bit",
+        repoID: "mlx-community/Qwen3.6-35B-A3B-4bit",
+        revision: "38740b847e4cb78f352aba30aa41c76e08e6eb46",
+        sourceIndexSHA256: "0b28df60e33753a14e816d3b31577ae2c93884c58430a4a6de6ae9ea483842ea",
+        approximateDownloadBytes: 20_430_000_000,
+        installedBytes: 19_600_000_000,
+        rangeStagingBytes: UInt64(RemoteChunkPolicy.defaultBytes),
+        reserveBytes: 2_147_483_648)
+
+    /// The packs the installer screen offers, in menu order. Mirrors
+    /// `SupportedModelSource.all` (the repack pins the importer has been
+    /// validated against); the vision companion is Gemma-only and lives
+    /// outside this catalog.
+    public static let catalog: [AppModelInstallDescriptor] = [.default, .qwen3_6_35B_A3B]
 
     public static let visionCompanion = AppModelInstallDescriptor(
         displayName: "Gemma 4 Image Support",

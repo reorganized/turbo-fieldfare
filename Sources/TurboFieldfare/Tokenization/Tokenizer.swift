@@ -47,6 +47,16 @@ public struct GFTokenizer: @unchecked Sendable {
     public static let chatTemplateIdentity = "gemma4-it-text-no-tools-v1"
     public static let toolChatTemplateIdentity = "gemma4-it-tools-jinja-v1"
 
+    /// Chat framing family. `gemma4IT` is the pinned hand-written renderer;
+    /// `qwenImStart` renders through the installed `chat_template.jinja`
+    /// sidecar and resolves `\u003c|im_end\u003e`-style stop tokens.
+    public enum ChatStyle: Sendable, Equatable {
+        case gemma4IT
+        case qwenImStart
+    }
+
+    public private(set) var chatStyle: ChatStyle = .gemma4IT
+
     public let bosID: Int32
     public let eosID: Int32
     public let padID: Int32
@@ -83,12 +93,62 @@ public struct GFTokenizer: @unchecked Sendable {
         try await GFTokenizerLoadCoordinator.shared.load(.local(folder.standardizedFileURL.path))
     }
 
-    public static func load(forModelDirectory modelDirectory: URL,
-                            environment: [String: String] = ProcessInfo.processInfo.environment) async throws -> GFTokenizer {
-        if let folder = tokenizerFolder(forModelDirectory: modelDirectory, environment: environment) {
+    /// Load with an explicit chat family / vocabulary size. Bypasses the
+    /// coordinator cache when a style is given (the coordinator has no style
+    /// dimension).
+    public static func load(from folder: URL,
+                            chatStyle: ChatStyle?,
+                            vocabSize: Int?) async throws -> GFTokenizer {
+        guard chatStyle != nil || vocabSize != nil else {
             return try await load(from: folder)
         }
-        return try await load()
+        return try await loadUncached(from: folder,
+                                      chatStyle: chatStyle,
+                                      vocabSize: vocabSize)
+    }
+
+    public static func load(forModelDirectory modelDirectory: URL,
+                            environment: [String: String] = ProcessInfo.processInfo.environment) async throws -> GFTokenizer {
+        let manifestStyle = Self.manifestChatStyle(modelDirectory)
+        let manifestVocab = Self.manifestVocabSize(modelDirectory)
+        if let folder = tokenizerFolder(forModelDirectory: modelDirectory, environment: environment) {
+            if manifestStyle == nil && manifestVocab == nil {
+                return try await load(from: folder)
+            }
+            return try await loadUncached(
+                from: folder,
+                chatStyle: manifestStyle,
+                vocabSize: manifestVocab)
+        }
+        let loaded = try await load()
+        var styled = loaded
+        if let style = manifestStyle { styled.chatStyle = style }
+        return styled
+    }
+
+    /// Best-effort read of `manifest.json -> arch` for the chat family and
+    /// vocabulary size. A missing or unreadable manifest falls back to the
+    /// Gemma-shaped defaults.
+    public static func manifestChatStyle(_ modelDirectory: URL) -> ChatStyle? {
+        guard let arch = readManifestArch(modelDirectory) else { return nil }
+        if let name = arch["archName"] as? String,
+           name.hasPrefix("qwen") {
+            return .qwenImStart
+        }
+        return nil
+    }
+
+    public static func manifestVocabSize(_ modelDirectory: URL) -> Int? {
+        guard let arch = readManifestArch(modelDirectory) else { return nil }
+        return arch["vocabSize"] as? Int
+    }
+
+    private static func readManifestArch(_ modelDirectory: URL) -> [String: Any]? {
+        let url = modelDirectory.appendingPathComponent("manifest.json")
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let arch = root["arch"] as? [String: Any] else { return nil }
+        return arch
     }
 
     public static func tokenizerFolder(forModelDirectory modelDirectory: URL,
@@ -112,21 +172,30 @@ public struct GFTokenizer: @unchecked Sendable {
         try await make(from: LanguageModelConfigurationFromHub(modelName: modelID))
     }
 
-    static func loadUncached(from folder: URL) async throws -> GFTokenizer {
-        try await make(from: LanguageModelConfigurationFromHub(modelFolder: folder))
+    static func loadUncached(from folder: URL,
+                             chatStyle: ChatStyle? = nil,
+                             vocabSize: Int? = nil) async throws -> GFTokenizer {
+        try await make(from: LanguageModelConfigurationFromHub(modelFolder: folder),
+                       chatStyle: chatStyle,
+                       vocabSize: vocabSize)
     }
 
     /// Build from the raw tokenizer configs so the decoder pipeline and the
     /// special-token set can be validated against `tokenizer.json` itself.
     /// Same fetch/caching path `AutoTokenizer.from(pretrained:)` uses internally.
-    private static func make(from hub: LanguageModelConfigurationFromHub) async throws -> GFTokenizer {
+    private static func make(from hub: LanguageModelConfigurationFromHub,
+                             chatStyle: ChatStyle? = nil,
+                             vocabSize: Int? = nil) async throws -> GFTokenizer {
         guard let tokenizerConfig = try await hub.tokenizerConfig else {
             throw GFTokenizerError.missingTokenizerConfig
         }
         let tokenizerData = try await hub.tokenizerData
         let underlying = try AutoTokenizer.from(
             tokenizerConfig: tokenizerConfig, tokenizerData: tokenizerData)
-        return try GFTokenizer(tokenizer: underlying, tokenizerData: tokenizerData)
+        return try GFTokenizer(tokenizer: underlying,
+                               tokenizerData: tokenizerData,
+                               chatStyle: chatStyle ?? .gemma4IT,
+                               vocabSize: vocabSize)
     }
 
     private static func hasTokenizerJSON(in folder: URL, fileManager: FileManager) -> Bool {
@@ -151,14 +220,23 @@ public struct GFTokenizer: @unchecked Sendable {
     /// tests instead.
     static func verifyDecoderConfiguration(_ tokenizerData: Config) throws {
         let decoder = tokenizerData["decoder"]
+        // The pinned Gemma 4 IT sequence: per-token pieces replace "▁" with a
+        // space, decode <0xXX> byte-fallback runs, and fuse whitespace.
         let steps = decoder.decoders.array(or: [])
-        guard decoder.type.string() == "Sequence",
-              steps.count == 3,
-              steps[0].type.string() == "Replace",
-              steps[0].pattern.String.string() == "▁",
-              steps[0].content.string() == " ",
-              steps[1].type.string() == "ByteFallback",
-              steps[2].type.string() == "Fuse"
+        if decoder.type.string() == "Sequence",
+           steps.count == 3,
+           steps[0].type.string() == "Replace",
+           steps[0].pattern.String.string() == "▁",
+           steps[0].content.string() == " ",
+           steps[1].type.string() == "ByteFallback",
+           steps[2].type.string() == "Fuse" {
+            return
+        }
+        // Qwen-style BPE: a single ByteLevel decoder (position-independent per
+        // token — each BPE token is a whole byte-level symbol). Everything else
+        // fails closed.
+        guard decoder.type.string() == "ByteLevel",
+              decoder.decoders.array(or: []).isEmpty
         else {
             throw GFTokenizerError.unsupportedDecoder(actual: decoder.description)
         }
@@ -189,9 +267,14 @@ public struct GFTokenizer: @unchecked Sendable {
         return value
     }
 
-    public init(tokenizer: any Tokenizer, tokenizerData: Config) throws {
+    public init(tokenizer: any Tokenizer, tokenizerData: Config,
+                chatStyle: ChatStyle = .gemma4IT,
+                vocabSize: Int? = nil) throws {
         self.tokenizer = tokenizer
-        try Self.verifyDecoderConfiguration(tokenizerData)
+        self.chatStyle = chatStyle
+        if chatStyle == .gemma4IT {
+            try Self.verifyDecoderConfiguration(tokenizerData)
+        }
 
         // The same `added_tokens[special == true]` ID set the library's
         // `decode(skipSpecialTokens: true)` filters before running its decoder.
@@ -203,14 +286,33 @@ public struct GFTokenizer: @unchecked Sendable {
         }
         self.specialTokenIDs = specials
 
-        guard let bos = tokenizer.bosTokenId else {
-            throw GFTokenizerError.missingSpecialToken("<bos>")
-        }
         guard let eos = tokenizer.eosTokenId else {
             throw GFTokenizerError.missingSpecialToken("<eos>")
         }
-        self.bosID = try Self.int32ID("<bos>", bos)
         self.eosID = try Self.int32ID("<eos>", eos)
+        if chatStyle == .qwenImStart {
+            // Qwen3.6 framing: resolve <|im_end|> tolerantly and keep the
+            // Gemma tool/channel/image machinery unset (the text-only path
+            // never reads it). Vocabulary size comes from the installed
+            // manifest when present.
+            self.bosID = try Self.int32ID("<eos>", eos)
+            self.padID = try Self.int32ID("<eos>", eos)
+            let imEndID = try? Self.requireTokenID(tokenizer, "<|im_end|>")
+            self.endOfTurnID = try imEndID ?? Self.int32ID("<eos>", eos)
+            self.toolCallStartID = try Self.int32ID("<eos>", eos)
+            self.toolCallEndID = try Self.int32ID("<eos>", eos)
+            self.toolResponseID = try Self.int32ID("<eos>", eos)
+            self.toolResponseEndID = try Self.int32ID("<eos>", eos)
+            self.channelStartID = try Self.int32ID("<eos>", eos)
+            self.channelEndID = try Self.int32ID("<eos>", eos)
+            self.stopTokenIDs = [self.eosID, self.endOfTurnID]
+            self.vocabSize = vocabSize ?? 262_144
+            return
+        }
+        guard let bos = tokenizer.bosTokenId else {
+            throw GFTokenizerError.missingSpecialToken("<bos>")
+        }
+        self.bosID = try Self.int32ID("<bos>", bos)
         self.padID = try Self.requireTokenID(tokenizer, "<pad>")
         self.endOfTurnID = try Self.requireTokenID(tokenizer, "<turn|>")
         self.toolCallStartID = try Self.requireTokenID(tokenizer, "<|tool_call>")
@@ -237,7 +339,7 @@ public struct GFTokenizer: @unchecked Sendable {
             }
         }
         self.stopTokenIDs = [self.eosID, self.endOfTurnID, self.toolResponseID]
-        self.vocabSize = 262_144
+        self.vocabSize = vocabSize ?? 262_144
     }
 
     /// Encode UTF-8 text to token IDs. `addBOS = true` prepends `<bos>`.
@@ -331,6 +433,44 @@ public struct GFTokenizer: @unchecked Sendable {
     private static let bosMark     = "<bos>"
 
     public func applyChatTemplate(_ messages: [Message]) throws -> String {
+        if chatStyle == .qwenImStart {
+            // Render through the installed chat_template.jinja sidecar
+            // (add_generation_prompt; thinking disabled). Fail closed when
+            // the sidecar carries no template.
+            guard tokenizer.hasChatTemplate else {
+                throw GFTokenizerError.missingToolTemplate
+            }
+            let upstream: [Tokenizers.Message] = try messages.map { message in
+                var value: Tokenizers.Message = [
+                    "role": message.role.rawValue,
+                    "content": message.content,
+                ]
+                if !message.toolCalls.isEmpty {
+                    value["tool_calls"] = try message.toolCalls.map { call -> [String: any Sendable] in
+                        [
+                            "id": call.id,
+                            "type": "function",
+                            "function": [
+                                "name": call.name,
+                                "arguments": try call.arguments.jinjaSendableValue(),
+                            ] as [String: any Sendable],
+                        ]
+                    }
+                }
+                if let toolCallID = message.toolCallID { value["tool_call_id"] = toolCallID }
+                if let name = message.name { value["name"] = name }
+                return value
+            }
+            let renderedTokens = try tokenizer.applyChatTemplate(
+                messages: upstream,
+                chatTemplate: nil,
+                addGenerationPrompt: true,
+                truncation: false,
+                maxLength: nil,
+                tools: nil,
+                additionalContext: ["enable_thinking": false])
+            return tokenizer.decode(tokens: renderedTokens, skipSpecialTokens: false)
+        }
         var s = Self.bosMark
         for (index, message) in messages.enumerated() {
             guard let rawContent = message.content else {
@@ -396,10 +536,60 @@ public struct GFTokenizer: @unchecked Sendable {
 
     public func encodeTextContinuation(userContent: String) -> [Int32] {
         let content = userContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        if chatStyle == .qwenImStart {
+            // Close the previous assistant turn, then render the next user
+            // turn + generation prompt through the jinja template.
+            let rendered = (try? self.applyChatTemplate([
+                Message(role: .user, content: content),
+            ])) ?? ""
+            return [endOfTurnID] + encode(rendered, addBOS: false)
+        }
         return [endOfTurnID] + encode(
             "\n\(Self.turnOpen)user\n\(content)\(Self.turnClose)\n"
                 + "\(Self.turnOpen)model\n<|channel>thought\n<channel|>",
             addBOS: false)
+    }
+
+    /// Chat messages to prompt token IDs. Gemma renders to text first; the
+    /// qwen style tokenizes through the jinja template directly so the
+    /// special markers are never re-split by the BPE encoder.
+    public func encodeChat(messages: [Message]) throws -> [Int32] {
+        if chatStyle == .qwenImStart {
+            guard tokenizer.hasChatTemplate else {
+                throw GFTokenizerError.missingToolTemplate
+            }
+            let upstream: [Tokenizers.Message] = try messages.map { message in
+                var value: Tokenizers.Message = [
+                    "role": message.role.rawValue,
+                    "content": message.content,
+                ]
+                if !message.toolCalls.isEmpty {
+                    value["tool_calls"] = try message.toolCalls.map { call -> [String: any Sendable] in
+                        [
+                            "id": call.id,
+                            "type": "function",
+                            "function": [
+                                "name": call.name,
+                                "arguments": try call.arguments.jinjaSendableValue(),
+                            ] as [String: any Sendable],
+                        ]
+                    }
+                }
+                if let toolCallID = message.toolCallID { value["tool_call_id"] = toolCallID }
+                if let name = message.name { value["name"] = name }
+                return value
+            }
+            return try tokenizer.applyChatTemplate(
+                messages: upstream,
+                chatTemplate: nil,
+                addGenerationPrompt: true,
+                truncation: false,
+                maxLength: nil,
+                tools: nil,
+                additionalContext: ["enable_thinking": false]
+            ).map(Int32.init)
+        }
+        return encode(try applyChatTemplate(messages), addBOS: false)
     }
 
     /// A user turn carrying images, encoded as a continuation onto an existing

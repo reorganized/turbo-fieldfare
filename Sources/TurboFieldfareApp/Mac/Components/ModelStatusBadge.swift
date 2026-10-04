@@ -8,15 +8,23 @@ struct ModelStatusBadge: View {
     var body: some View {
         HStack(spacing: 6) {
             statusDot
-            Text("Gemma 4 26B")
+            Text(label)
                 .font(.callout.weight(.semibold))
                 .lineLimit(1)
-                .help(model.installDescriptor.repoID)
+                .help(help)
                 .accessibilityLabel("Model")
                 .accessibilityValue(model.installDescriptor.repoID)
                 .accessibilityIdentifier(.hudStatus)
         }
     }
+
+    /// The directory name, so any pack is labeled by what it actually is.
+    private var label: String {
+        model.modelPathText.split(separator: "/").last
+            .map(String.init) ?? model.modelPathText
+    }
+
+    private var help: String { model.installDescriptor.repoID }
 
     @ViewBuilder
     private var statusDot: some View {

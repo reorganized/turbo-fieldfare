@@ -1,6 +1,22 @@
 import Foundation
 
 enum AppModelLocation {
+    /// The last model the user chose, honored before every default. One key,
+    /// one line each way; the per-model settings file carries everything else.
+    static var lastChosenPath: String? {
+        get { UserDefaults.standard.string(forKey: "lastModelDirectory") }
+        set { UserDefaults.standard.set(newValue, forKey: "lastModelDirectory") }
+    }
+
+    /// The launch model: the user's last choice if it still exists, else the
+    /// pinned default.
+    static func launchURL(fileExists: (String) -> Bool = FileManager.default.fileExists(atPath:)) -> URL {
+        if let path = lastChosenPath, fileExists(path) {
+            return URL(fileURLWithPath: path, isDirectory: true)
+        }
+        return defaultURL()
+    }
+
     static func defaultURL() -> URL {
         let fileManager = FileManager.default
         let applicationSupport = (try? fileManager.url(

@@ -46,6 +46,15 @@ inline float int8_gelu_pytorch_tanh(float x) {
     return 0.5f * x * (1.0f + tanh(inner));
 }
 
+// Compile-time activation select for the shared-expert gate/up fusion
+// (Qwen3-Next uses SiLU). Index 74 is unassigned in dequant_int8.
+constant bool FC_INT8_ACT_SILU [[function_constant(74)]];
+static inline float int8_gated_act(float gate) {
+    return is_function_constant_defined(FC_INT8_ACT_SILU) && FC_INT8_ACT_SILU
+        ? gate / (1.0f + fast::exp(-gate))
+        : int8_gelu_pytorch_tanh(gate);
+}
+
 // y[m] = sum_{n} W[m, n] * x[n]. One-SIMD-per-row variant: 32 threads
 // cooperate on a single output row, each handling 2 elements per group of 64.
 // Mirror of `dequant_int4_gemv_simd` but with one byte per element (no nibble
@@ -149,6 +158,6 @@ kernel void shared_int8_gate_up_act_simd(
     if (lane == 0) {
         float gate_half = float(half(gate_acc));
         float up_half = float(half(up_acc));
-        act[row] = half(int8_gelu_pytorch_tanh(gate_half) * up_half);
+        act[row] = half(int8_gated_act(gate_half) * up_half);
     }
 }

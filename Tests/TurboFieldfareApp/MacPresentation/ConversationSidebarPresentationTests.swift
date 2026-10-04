@@ -61,7 +61,11 @@ import TurboFieldfare
     }
 
     @Test func sectionsAreOrderedNewestFirstWithinAndBetween() {
-        let now = Date()
+        // Pinned away from a day boundary: a wall-clock `now` inside an hour
+        // of midnight puts `now - 1h` in Yesterday and flips the expected
+        // grouping depending on when the suite runs.
+        let now = calendar.date(from: DateComponents(
+            year: 2026, month: 8, day: 31, hour: 14))!
         let today = meta("today", updatedAt: now.addingTimeInterval(-60))
         let earlierToday = meta("earlier", updatedAt: now.addingTimeInterval(-3_600))
         let old = meta("old", updatedAt: now.addingTimeInterval(-60 * 60 * 24 * 30))

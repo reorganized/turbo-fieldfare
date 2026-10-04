@@ -71,7 +71,17 @@ public struct ConversationIdentity: Sendable, Equatable, Codable {
         return ConversationIdentity(
             modelID: manifest.modelID,
             sourceSnapshotHash: snapshot,
-            templateIdentity: GFTokenizer.chatTemplateIdentity,
+            templateIdentity: templateIdentity(forModelDirectory: directoryURL),
             imageProcessingVersion: VisionImageProcessing.version)
+    }
+
+    /// The chat framing of the model at a directory, from its manifest alone.
+    /// The Qwen family renders through its installed `chat_template.jinja`
+    /// rather than the hand-written Gemma renderer, and token IDs from one do
+    /// not mean what they mean in the other.
+    public static func templateIdentity(forModelDirectory directoryURL: URL) -> String {
+        GFTokenizer.manifestChatStyle(directoryURL) == .qwenImStart
+            ? "qwen3.6-im-jinja-v1"
+            : GFTokenizer.chatTemplateIdentity
     }
 }

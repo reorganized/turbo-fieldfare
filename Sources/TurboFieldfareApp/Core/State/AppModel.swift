@@ -182,6 +182,12 @@ public final class AppModel {
     /// running process, and re-reading it per query would make the menu, the
     /// clamp and the load refusal three separate answers.
     private let hostMemoryBytes: UInt64
+    /// The architecture the model at the probed directory resolves to, read
+    /// from its manifest (nil archName on legacy manifests stays Gemma). Every
+    /// context figure in the app derives from this instead of a pinned
+    /// profile, so a Qwen pack's cheaper KV shows in the menu and its ceiling
+    /// governs the request check.
+    public private(set) var resolvedArchConfig: ArchConfig = .gemma4_26B_A4B
     public let isVisionRuntimeSupported: Bool
     /// The stored conversations and which one is open.
     public let history = ConversationHistoryState()
@@ -235,12 +241,21 @@ public final class AppModel {
                     ConversationStore(rootURL: $0)
                 },
                 hostMemoryBytes: UInt64 = ContextAdmission.hostMemoryBytes) {
-        let directory = (modelDirectory ?? AppModelLocation.defaultURL()).standardizedFileURL
+        let directory = (modelDirectory ?? AppModelLocation.launchURL()).standardizedFileURL
         let installETAClock = SuspendingClock()
         let settings = settingsPersistenceEnabled
             ? MacAppSettingsFileStore.loadOrCreate(forModelDirectory: directory)
             : MacAppSettings()
         self.modelPathText = directory.path
+        // The manifest read the CLI makes before a run, done before the
+        // admission clamp so the stored context is judged against the real
+        // model. A manifest that cannot be read keeps the shipped default.
+        let resolvedConfig: ArchConfig
+        do {
+            resolvedConfig = try ManifestReader.loadArch(directoryURL: directory) ?? .gemma4_26B_A4B
+        } catch {
+            resolvedConfig = .gemma4_26B_A4B
+        }
         // The app always releases the image tower after each image. Keeping it
         // resident saves a few hundred milliseconds on a run of images and
         // holds about 1 GB of page cache to do it — a trade worth exposing to
@@ -254,7 +269,9 @@ public final class AppModel {
             visionResidencyPolicy: .onDemand)
         let admitted = Self.admittedContext(settings.contextTokens,
                                             hostMemoryBytes: hostMemoryBytes,
-                                            expertCacheSlots: settings.expertCacheSlots)
+                                            expertCacheSlots: settings.expertCacheSlots,
+                                            config: resolvedConfig)
+        self.resolvedArchConfig = resolvedConfig
         self.maxContextTokens = admitted.tokens
         self.contextClampNotice = admitted.notice
         self.temperature = settings.temperature
@@ -315,7 +332,8 @@ public final class AppModel {
 
     /// What the Context picker may offer on this Mac.
     public var contextOptions: [AppContextLengthOption] {
-        AppContextLengthOption.available(on: hostMemoryBytes, expertCacheSlots: runtimeOptions.expertCacheSlots)
+        AppContextLengthOption.available(on: hostMemoryBytes, expertCacheSlots: runtimeOptions.expertCacheSlots,
+                                         config: resolvedArchConfig)
     }
 
     /// The caption under the Context picker when admission is hiding rows.
@@ -323,18 +341,20 @@ public final class AppModel {
     /// Static and free of SwiftUI so the sentence a user reads is covered by a
     /// test rather than by looking at the window. Nil when every size is
     /// offered — there is then nothing to explain.
-    public nonisolated static func contextOptionsNote(hostMemoryBytes: UInt64, expertCacheSlots: Int = 16) -> String? {
+    public nonisolated static func contextOptionsNote(hostMemoryBytes: UInt64, expertCacheSlots: Int = 16,
+                                                      config: ArchConfig = .gemma4_26B_A4B) -> String? {
         let hidden = AppContextLengthOption.allCases.filter {
-            $0.availability(hostMemoryBytes: hostMemoryBytes, expertCacheSlots: expertCacheSlots) != .available
+            $0.availability(hostMemoryBytes: hostMemoryBytes, expertCacheSlots: expertCacheSlots, config: config) != .available
         }
         guard !hidden.isEmpty else { return nil }
         return hidden
-            .map { $0.needDescription(hostMemoryBytes: hostMemoryBytes, expertCacheSlots: expertCacheSlots) }
+            .map { $0.needDescription(hostMemoryBytes: hostMemoryBytes, expertCacheSlots: expertCacheSlots, config: config) }
             .joined(separator: " ")
     }
 
     public var contextOptionsNote: String? {
-        Self.contextOptionsNote(hostMemoryBytes: hostMemoryBytes, expertCacheSlots: runtimeOptions.expertCacheSlots)
+        Self.contextOptionsNote(hostMemoryBytes: hostMemoryBytes, expertCacheSlots: runtimeOptions.expertCacheSlots,
+                                config: resolvedArchConfig)
     }
 
     /// A stored context this host cannot back, replaced with the largest it
@@ -346,14 +366,15 @@ public final class AppModel {
     nonisolated static func admittedContext(
         _ tokens: Int,
         hostMemoryBytes: UInt64,
-        expertCacheSlots: Int = 16
+        expertCacheSlots: Int = 16,
+        config: ArchConfig = .gemma4_26B_A4B
     ) -> (tokens: Int, notice: String?) {
-        let config = ArchConfig.gemma4_26B_A4B
         guard case .needsMemory = ContextAdmission.availability(
             config: config, maxContext: tokens, hostMemoryBytes: hostMemoryBytes, expertCacheSlots: expertCacheSlots) else {
             return (tokens, nil)
         }
-        let fallback = AppContextLengthOption.largestAvailable(on: hostMemoryBytes, expertCacheSlots: expertCacheSlots)
+        let fallback = AppContextLengthOption.largestAvailable(on: hostMemoryBytes, expertCacheSlots: expertCacheSlots,
+                                                               config: config)
         let need = ContextAdmission.needDescription(config: config,
                                                     maxContext: tokens,
                                                     hostMemoryBytes: hostMemoryBytes, expertCacheSlots: expertCacheSlots)
@@ -399,7 +420,12 @@ public final class AppModel {
 
     public var requiresModelInstallation: Bool { !isModelInstalled }
 
-    public var installDescriptor: AppModelInstallDescriptor { installer.descriptor }
+    /// The pack the install screen is working on: the last one handed to
+    /// `installModel(_:)`, defaulting to the pinned Gemma pack. Byte math and
+    /// identity on the install screen read this, not the installer's default.
+    public private(set) var activeInstallDescriptor: AppModelInstallDescriptor = .default
+
+    public var installDescriptor: AppModelInstallDescriptor { activeInstallDescriptor }
 
     public var installRequirement: AppModelInstallRequirement? {
         installReadiness.requirement
@@ -453,6 +479,9 @@ public final class AppModel {
         // A layout with nowhere to put a companion cannot be repaired by
         // downloading one, so do not offer to.
         guard visionInstallationStatus != .unsupportedLayout else { return false }
+        // The companion pack is built against the Gemma checkpoint; offering it
+        // beside any other pack would accept an image and mis-render it.
+        guard activeInstallDescriptor == .default else { return false }
         guard isModelInstalled, !isVisionPackInstalled,
               case .ready = visionInstallReadiness else { return false }
         if case .readyToActivate = visionInstallState { return false }
@@ -823,6 +852,7 @@ public final class AppModel {
         let path = url.standardizedFileURL.path
         guard path != modelPathText else { return }
 
+        AppModelLocation.lastChosenPath = path
         modelPathText = path
         clearImages()
         applyPersistedSettings(
@@ -877,7 +907,7 @@ public final class AppModel {
 
     public func perform(_ action: AppModelAction) {
         switch action {
-        case .install: installModel()
+        case .install: installModel(activeInstallDescriptor)
         case .cancelInstall: cancelInstall()
         case .load, .retryLoad: loadModel()
         case .cancelLoad: cancelLoad()
@@ -909,7 +939,8 @@ public final class AppModel {
         runtimeOptions.expertCacheSlots = slots
         let admitted = Self.admittedContext(maxContextTokens,
                                             hostMemoryBytes: hostMemoryBytes,
-                                            expertCacheSlots: slots)
+                                            expertCacheSlots: slots,
+                                            config: resolvedArchConfig)
         if admitted.tokens != maxContextTokens {
             setMaxContextTokens(admitted.tokens)
             contextClampNotice = admitted.notice
@@ -1270,11 +1301,11 @@ public final class AppModel {
         // the moment a command buffer binds it, so a host that cannot hold it
         // does not find out part-way through a load: it is killed.
         if case .needsMemory = ContextAdmission.availability(
-            config: ArchConfig.gemma4_26B_A4B,
+            config: resolvedArchConfig,
             maxContext: maxContext,
             hostMemoryBytes: hostMemoryBytes, expertCacheSlots: runtimeOptions.expertCacheSlots) {
             loadState = .failed(.modelLoadFailed(
-                ContextAdmission.needDescription(config: ArchConfig.gemma4_26B_A4B,
+                ContextAdmission.needDescription(config: resolvedArchConfig,
                                                  maxContext: maxContext,
                                                  hostMemoryBytes: hostMemoryBytes, expertCacheSlots: runtimeOptions.expertCacheSlots)))
             return
@@ -1376,11 +1407,14 @@ public final class AppModel {
         }
     }
 
-    public func installModel() {
+    public func installModel(_ descriptor: AppModelInstallDescriptor = .default) {
         guard !isRunning, !loadState.isLoading, !isInstallingModel,
               requiresModelInstallation else {
             return
         }
+        // The active pack drives the install screen's identity, storage card,
+        // and byte math; choosing it is part of installing.
+        activeInstallDescriptor = descriptor
         refreshInstallReadiness()
         guard canInstallModel else { return }
         installTask?.cancel()
@@ -1392,7 +1426,7 @@ public final class AppModel {
         installState = .checking
         installTask = Task { [weak self, installer] in
             do {
-                for try await event in installer.installDefaultModel(outputDirectory: outputDirectory) {
+                for try await event in installer.install(descriptor, outputDirectory: outputDirectory) {
                     guard let self else { return }
                     self.applyInstallEvent(event, generation: generation)
                 }
@@ -1642,9 +1676,17 @@ public final class AppModel {
     }
 
     private func refreshInstallReadiness(at outputDirectory: URL) {
-        installationStatus = AppModelInstallationProbe.status(
-            at: outputDirectory,
-            descriptor: installer.descriptor)
+        installationStatus = AppModelInstallationProbe.status(at: outputDirectory)
+        // The same read the CLI makes before a run: the manifest's recorded
+        // archName picks the profile, and a manifest that cannot be read keeps
+        // the shipped default. A directory with no manifest is not installed,
+        // so nothing downstream consults the cached config for it.
+        do {
+            resolvedArchConfig = try ManifestReader.loadArch(directoryURL: outputDirectory)
+                ?? .gemma4_26B_A4B
+        } catch {
+            resolvedArchConfig = .gemma4_26B_A4B
+        }
         do {
             modelStorageMetrics = FileManager.default.fileExists(atPath: outputDirectory.path)
                 ? try AppModelStorageMetrics.measure(at: outputDirectory) : nil
@@ -1657,6 +1699,7 @@ public final class AppModel {
         installReadiness = .checking
         do {
             let requirement = try installer.checkInstallRequirement(
+                activeInstallDescriptor,
                 outputDirectory: outputDirectory)
             installReadiness = requirement.canInstall
                 ? .ready(requirement)
@@ -1937,9 +1980,7 @@ public final class AppModel {
         case .installed(let directory):
             resetInstallETA()
             let directory = directory.standardizedFileURL
-            installationStatus = AppModelInstallationProbe.status(
-                at: directory,
-                descriptor: installer.descriptor)
+            installationStatus = AppModelInstallationProbe.status(at: directory)
             guard installationStatus == .complete else {
                 finishInstallFailure(
                     RepackError.configurationInvalid(detail: "completed install did not pass metadata validation"),
@@ -2050,7 +2091,8 @@ public final class AppModel {
         // because the assignment clears it.
         let admitted = Self.admittedContext(settings.contextTokens,
                                             hostMemoryBytes: hostMemoryBytes,
-                                            expertCacheSlots: settings.expertCacheSlots)
+                                            expertCacheSlots: settings.expertCacheSlots,
+                                            config: resolvedArchConfig)
         maxContextTokens = admitted.tokens
         contextClampNotice = admitted.notice
         temperature = settings.temperature
@@ -2721,7 +2763,8 @@ public final class AppModel {
             // the service's own exact state, while every image fails closed.
             conversationTokens: conversation.kvTokens ?? effective.maxContextTokens,
             conversationEpoch: ticket?.epoch,
-            turnIndex: ticket?.index)
+            turnIndex: ticket?.index,
+            maxPositionEmbeddings: resolvedArchConfig.maxPositionEmbeddings)
         try request.validate(requireModelDirectory: true)
         return request
     }

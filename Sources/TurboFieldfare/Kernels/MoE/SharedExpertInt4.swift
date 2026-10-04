@@ -20,11 +20,16 @@ public enum SharedExpertError: Error, CustomStringConvertible {
 
 public final class SharedExpertInt4 {
     private let int4: DequantInt4GEMV
-    private let geluMulPSO: MTLComputePipelineState
+    private let mulPSO: MTLComputePipelineState
 
-    public init(context: MetalContext) throws {
+    public init(context: MetalContext, activation: GatedActivation = .geluPytorchTanh) throws {
         self.int4 = try DequantInt4GEMV(context: context)
-        self.geluMulPSO = try context.pipeline("gelu_mul_fp16")
+        switch activation {
+        case .geluPytorchTanh:
+            self.mulPSO = try context.pipeline("gelu_mul_fp16")
+        case .silu:
+            self.mulPSO = try context.pipeline("silu_mul_fp16")
+        }
     }
 
     public func encode(commandBuffer cb: MTLCommandBuffer,
@@ -73,13 +78,13 @@ public final class SharedExpertInt4 {
                     m: up.rows, n: up.cols)
 
         guard let encoder = cb.makeComputeCommandEncoder() else { return }
-        encoder.setComputePipelineState(geluMulPSO)
+        encoder.setComputePipelineState(mulPSO)
         encoder.setBuffer(scratchGate, offset: scratchGateOffset, index: 0)
         encoder.setBuffer(scratchUp, offset: scratchUpOffset, index: 1)
         encoder.setBuffer(scratchAct, offset: scratchActOffset, index: 2)
         var count = UInt32(intermediate)
         encoder.setBytes(&count, length: MemoryLayout<UInt32>.size, index: 3)
-        let width = min(geluMulPSO.maxTotalThreadsPerThreadgroup, 256)
+        let width = min(mulPSO.maxTotalThreadsPerThreadgroup, 256)
         encoder.dispatchThreads(MTLSize(width: intermediate, height: 1, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
         encoder.endEncoding()
@@ -103,11 +108,15 @@ public final class SharedExpertRuntime {
     private let implementation: Implementation
     public let weightBits: Int
 
-    public init(context: MetalContext, weightBits: Int) throws {
+    public init(context: MetalContext,
+                weightBits: Int,
+                activation: GatedActivation = .geluPytorchTanh) throws {
         self.weightBits = weightBits
         switch weightBits {
-        case 4: self.implementation = .int4(try SharedExpertInt4(context: context))
-        case 8: self.implementation = .int8(try SharedExpertInt8(context: context))
+        case 4: self.implementation = .int4(try SharedExpertInt4(context: context,
+                                                                 activation: activation))
+        case 8: self.implementation = .int8(try SharedExpertInt8(context: context,
+                                                                 activation: activation))
         default: throw SharedExpertError.unsupportedWeightBits(weightBits)
         }
     }

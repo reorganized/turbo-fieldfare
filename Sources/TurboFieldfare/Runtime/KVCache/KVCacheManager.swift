@@ -2,10 +2,13 @@ import Foundation
 import Darwin
 import Metal
 
-/// Which attention variant a layer runs. Gemma 4 interleaves 25 sliding-window
-/// layers with 5 full-attention layers (the latter carry the K=V shared-tensor
-/// quirk). Sourced from `ArchConfig.fullAttentionLayerMask`.
-public enum LayerKind: Sendable { case swa, full }
+/// Which per-layer recurrent state a layer keeps. Gemma 4 interleaves
+/// sliding-window and full-attention layers; Qwen3.6 hybrids run
+/// gated-delta-rule linear-attention layers, which keep an fp32
+/// `[numVHeads, Dv, Dk]` state and a conv window instead of K/V rows.
+/// Sourced from `ArchConfig.fullAttentionLayerMask` plus
+/// `ArchConfig.nonFullLayerKind`.
+public enum LayerKind: Sendable { case swa, full, linear }
 
 /// A read view the attention kernels bind. `offset` stays 0; ring-enabled SWA
 /// layers expose the physical start slot for diagnostics while kernels map
@@ -105,24 +108,67 @@ public final class KVCacheManager {
 
         for layer in 0..<config.numLayers {
             let isFull = config.fullAttentionLayerMask[layer] != 0
-            let stride = isFull ? fullStride : swaStride
-            let capacity = ringEnabled && !isFull ? swaCapacity : maxContext
-            let length = capacity * stride
+            let kind: LayerKind
+            let stride: Int
+            let capacity: Int
+            let kLength: Int
+            let vLength: Int
+            if config.usesLinearAttention && !isFull {
+                // fp32 delta-rule state [numVHeads, Dv, Dk] in the K slot,
+                // fp16 conv window [kernel - 1, convDim] in the V slot. No
+                // per-token rows: stride 0, capacity 1.
+                let stateBytes = config.linearNumValueHeads
+                    * config.linearValueHeadDim
+                    * config.linearKeyHeadDim
+                    * MemoryLayout<Float32>.size
+                let convBytes = (config.linearConvKernelDim - 1)
+                    * (config.linearNumKeyHeads * config.linearKeyHeadDim * 2
+                       + config.linearNumValueHeads * config.linearValueHeadDim)
+                    * Self.fp16Size
+                kind = .linear
+                stride = 0
+                capacity = 1
+                kLength = stateBytes
+                vLength = convBytes
+            } else {
+                kind = isFull ? .full : .swa
+                stride = isFull ? fullStride : swaStride
+                capacity = ringEnabled && !isFull ? swaCapacity : maxContext
+                kLength = capacity * stride
+                vLength = kLength
+            }
 
-            guard let kBuf = device.makeBuffer(length: length, options: .storageModeShared) else {
-                throw ModelError.kvAllocationFailed(layer: layer, bytes: length)
+            guard let kBuf = device.makeBuffer(length: max(kLength, 1), options: .storageModeShared) else {
+                throw ModelError.kvAllocationFailed(layer: layer, bytes: kLength)
             }
             kBuf.label = "kv.K.layer\(layer)"
+            // Metal recycles buffer pages without zeroing; the delta-rule
+            // state and the conv window both start from zero, so linear
+            // layers get an explicit clear (KV layers never read unwritten
+            // rows and skip this).
+            if kind == .linear {
+                memset(kBuf.contents(), 0, kLength)
+                if ProcessInfo.processInfo.environment["TURBO_QWEN_DUMP_DIR"] != nil {
+                    let base = kBuf.contents()
+                    let v0 = base.load(as: Float32.self)
+                    let v1 = base.load(fromByteOffset: 4, as: Float32.self)
+                    let v2 = base.load(fromByteOffset: 8, as: Float32.self)
+                    print("[kvinit] layer", layer, "state[0..2] =", v0, v1, v2)
+                }
+            }
             ks.append(kBuf)
 
-            guard let vBuf = device.makeBuffer(length: length, options: .storageModeShared) else {
-                throw ModelError.kvAllocationFailed(layer: layer, bytes: length)
+            guard let vBuf = device.makeBuffer(length: max(vLength, 1), options: .storageModeShared) else {
+                throw ModelError.kvAllocationFailed(layer: layer, bytes: vLength)
             }
             vBuf.label = "kv.V.layer\(layer)"
+            if kind == .linear {
+                memset(vBuf.contents(), 0, vLength)
+            }
             vs.append(vBuf)
 
             st.append(stride)
-            kd.append(isFull ? .full : .swa)
+            kd.append(kind)
             caps.append(capacity)
         }
 
@@ -152,16 +198,35 @@ public final class KVCacheManager {
         return capacityTokens[layer] * strides[layer]
     }
 
-    /// Write target for this layer's K projection at `position`.
+    /// Read/write buffer for a linear-attention layer's fp32 recurrence
+    /// state `[numVHeads, Dv, Dk]`. `nil` unless the layer is `.linear`.
+    public func stateBuffer(layer: Int) -> MTLBuffer? {
+        guard kinds[layer] == .linear else { return nil }
+        return kBuffers[layer]
+    }
+
+    /// Read/write buffer for a linear-attention layer's depthwise conv
+    /// window `[kernel - 1, convDim]` FP16. `nil` unless the layer is
+    /// `.linear`.
+    public func convWindowBuffer(layer: Int) -> MTLBuffer? {
+        guard kinds[layer] == .linear else { return nil }
+        return vBuffers[layer]
+    }
+
+    /// Write target for this layer's K projection at `position`. Linear
+    /// layers have no per-token rows and must not use this.
     public func kSlot(layer: Int, position: Int) -> (buffer: MTLBuffer, offset: Int) {
+        precondition(kinds[layer] != .linear,
+                     "kSlot is not valid for a linear-attention state layer")
         validateRange(start: position, count: 1)
         return (kBuffers[layer], physicalSlot(layer: layer, position: position) * strides[layer])
     }
 
-    /// Write target for this layer's V projection at `position`. Always
-    /// distinct from `kSlot` — full layers no longer alias K and V (Gemma 4
-    /// applies different per-head norms + RoPE to K vs V; gemma4-block.md §2.2).
+    /// Write target for this layer's V projection at `position`. Linear layers
+    /// have no per-token rows and must not use this.
     public func vSlot(layer: Int, position: Int) -> (buffer: MTLBuffer, offset: Int) {
+        precondition(kinds[layer] != .linear,
+                     "vSlot is not valid for a linear-attention state layer")
         validateRange(start: position, count: 1)
         return (vBuffers[layer], physicalSlot(layer: layer, position: position) * strides[layer])
     }
@@ -220,7 +285,10 @@ public final class KVCacheManager {
     }
 
     /// Maximum safe rewind before a reused SWA ring slot could become visible.
+    /// Delta-rule state cannot be un-applied, so any arch with linear-attention
+    /// layers refuses to rewind at all (server continuation must reset).
     public var maxRewindTokens: Int {
+        if kinds.contains(.linear) { return 0 }
         guard fp16RingEnabled else { return maxContext }
         var slack = maxContext
         for layer in 0..<config.numLayers where kinds[layer] == .swa {
@@ -256,6 +324,12 @@ public final class KVCacheManager {
         let pageSize = Int(getpagesize())
         var advised = Set<ObjectIdentifier>()
         for layer in 0..<config.numLayers {
+            // Delta-rule state cannot survive a reset: zero it back to the
+            // fresh-generation state (the conv window with it).
+            if kinds[layer] == .linear {
+                memset(kBuffers[layer].contents(), 0, kBuffers[layer].length)
+                memset(vBuffers[layer].contents(), 0, vBuffers[layer].length)
+            }
             advise(kBuffers[layer], pageSize: pageSize, seen: &advised)
             advise(vBuffers[layer], pageSize: pageSize, seen: &advised)
         }

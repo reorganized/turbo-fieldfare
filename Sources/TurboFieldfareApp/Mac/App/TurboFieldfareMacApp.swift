@@ -169,6 +169,8 @@ struct TurboFieldfareMacApp: App {
                     .disabled(!model.canCancelInstall)
             }
             CommandMenu("Model") {
+                ModelChooserMenu(model: model)
+                Divider()
                 Button("Load Model", action: model.loadModel)
                     .disabled(!model.canLoadModel)
                 Button("Reload Model", action: model.reloadModel)
