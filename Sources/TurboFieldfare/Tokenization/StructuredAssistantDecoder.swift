@@ -5,7 +5,18 @@ public enum StructuredAssistantEvent: Equatable, Sendable {
     case toolCall(ParsedToolCall)
 }
 
-public final class StructuredAssistantDecoder: @unchecked Sendable {
+/// Assistant-output decoders for tool-template requests. Both implementations
+/// turn (tokenID, delta) pairs into content/tool-call events; see
+/// `StructuredAssistantDecoder` (Gemma, token-ID state machine) and
+/// `QwenXMLAssistantDecoder` (Qwen3.6, text-level markup scanning).
+public protocol AssistantStreamDecoding: AnyObject, Sendable {
+    func consume(tokenID: Int32, delta: String) throws -> [StructuredAssistantEvent]
+    func consumeTail(_ text: String) throws -> [StructuredAssistantEvent]
+    func finish() throws
+    var hasToolCalls: Bool { get }
+}
+
+public final class StructuredAssistantDecoder: @unchecked Sendable, AssistantStreamDecoding {
     private enum Channel {
         case thought
         case visible

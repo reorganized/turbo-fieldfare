@@ -1108,10 +1108,15 @@ public actor ServerModelSession: ServerInferenceBackend {
             maxContext - effectivePromptIDs.count)
         config.stopStrings = []
 
-        let decoder = needsToolTemplate
-            ? StructuredAssistantDecoder(
-                tokenizer: tokenizer,
-                allowedTools: Set(request.tools.map(\.name)))
+        // Qwen3.6 emits tool calls as text markup instead of special tokens
+        // (its markers are aliased to <eos>), so it needs the text-level
+        // decoder; Gemma keeps the token-ID one.
+        let decoder: (any AssistantStreamDecoding)? = needsToolTemplate
+            ? (tokenizer.chatStyle == .qwenImStart
+                ? QwenXMLAssistantDecoder(tools: request.tools) as any AssistantStreamDecoding
+                : StructuredAssistantDecoder(
+                    tokenizer: tokenizer,
+                    allowedTools: Set(request.tools.map(\.name))))
             : nil
         var stopMatcher = StreamingStopMatcher(stops: request.generationConfig.stopStrings)
         var content = ""

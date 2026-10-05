@@ -214,6 +214,13 @@ execute them. The client runs the tool loop:
    match the call it resolves.
 5. Send the complete history and tool schemas again.
 
+Qwen3.6 writes calls as `<tool_call><function=…><parameter=…>` text, as its
+chat template asks. The server turns each complete block for a known tool into
+a `tool_calls` entry. Parameters whose schema type is not `string` are decoded
+as JSON; all others keep the model's text. A block that does not parse, or
+names an unknown tool, is returned as ordinary content with
+`finish_reason: "stop"`; it does not fail the request.
+
 The server accepts only function tools. Omit `tool_choice` or set it to `auto`
 to allow calls. Set it to `none` to disable them. The server does not support
 `required`, named tool selection, or `parallel_tool_calls: false`.
