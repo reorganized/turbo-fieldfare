@@ -27,6 +27,10 @@ do {
 
 do {
     let signals = ServerTerminationSignals()
+    let catalog = Dictionary(
+        uniqueKeysWithValues: arguments.models.map {
+            ($0.id, URL(fileURLWithPath: $0.directory).standardizedFileURL)
+        })
     let modelURL = URL(fileURLWithPath: arguments.model).standardizedFileURL
     let backend = try await ServerModelSession.load(
         modelDirectory: modelURL,
@@ -36,12 +40,15 @@ do {
         },
         visionResidencyPolicy: arguments.visionResidency,
         promptCacheMode: arguments.promptCacheMode,
-        runtimeConfiguration: runtimeConfiguration)
+        runtimeConfiguration: runtimeConfiguration,
+        modelCatalog: catalog,
+        currentModelID: arguments.modelID)
     let server = TurboFieldfareHTTPServer(
         modelID: arguments.modelID,
         queueLimit: arguments.queueLimit,
         backend: backend,
-        visionCapability: backend.visionCapability)
+        visionCapability: backend.visionCapability,
+        knownModelIDs: arguments.models.map(\.id))
     _ = try await server.start(port: arguments.port)
     print("TurboFieldfareServer ready at http://127.0.0.1:\(arguments.port) model=\(arguments.modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue) vision=\(backend.visionCapability) vision_residency=\(arguments.visionResidency.rawValue)")
 

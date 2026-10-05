@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import Synchronization
 import TurboFieldfare
 
 public enum ServerInferenceEvent: Equatable, Sendable {
@@ -277,12 +278,18 @@ public protocol ServerInferenceBackend: Sendable {
                   onEvent: @escaping @Sendable (ServerInferenceEvent) -> Void) async throws -> ServerCompletion
     func generate(_ prepared: ServerPreparedRequest,
                   onEvent: @escaping @Sendable (ServerInferenceEvent) -> Void) async throws -> ServerCompletion
+    func activateModel(_ id: String) async throws
+    func currentVisionCapability() async -> String
 }
 
 public extension ServerInferenceBackend {
     func prepare(_ request: ValidatedChatRequest) async throws -> ServerPreparedRequest {
         ServerPreparedRequest(request: request)
     }
+
+    func activateModel(_ id: String) async throws {}
+
+    func currentVisionCapability() async -> String { "missing" }
 
     func generate(
         _ prepared: ServerPreparedRequest,
@@ -303,9 +310,12 @@ public actor ServerCoordinator {
     private var active = false
     private var waiters: [Waiter] = []
     private var shuttingDown = false
+    private var switching = false
+    private(set) var currentModelID: String
 
-    public init(queueLimit: Int) {
+    public init(queueLimit: Int, currentModelID: String = "") {
         self.queueLimit = queueLimit
+        self.currentModelID = currentModelID
     }
 
     public func run<T: Sendable>(
@@ -319,12 +329,35 @@ public actor ServerCoordinator {
     }
 
     func runPreparing<Prepared: Sendable, T: Sendable>(
+        requestedModel: String? = nil,
+        activate: (@Sendable (String) async throws -> Void)? = nil,
         onQueued: @escaping @Sendable () -> Void = {},
         prepare: @escaping @Sendable () async throws -> Prepared,
         operation: @escaping @Sendable (Prepared) async throws -> T
     ) async throws -> T {
         try Task.checkCancellation()
         guard !shuttingDown else { throw CancellationError() }
+        // The idle gate: a model swap is only allowed while nothing is
+        // admitted, preparing, or generating, and it blocks every other
+        // request — including one for the model being torn down — until it
+        // finishes.
+        let target = requestedModel ?? currentModelID
+        if switching { throw ServerRequestError.modelBusy }
+        if !target.isEmpty && target != currentModelID {
+            guard admittedCount == 0, !active else {
+                throw ServerRequestError.modelBusy
+            }
+            switching = true
+            defer { switching = false }
+            do {
+                try await activate?(target)
+                currentModelID = target
+            } catch {
+                // Load failed after unload; a later request may retry.
+                currentModelID = ""
+                throw error
+            }
+        }
         guard admittedCount <= queueLimit else { throw ServerRequestError.queueFull }
         admittedCount += 1
         defer { admittedCount -= 1 }
@@ -509,19 +542,42 @@ enum ServerRequestImages {
 }
 
 public actor ServerModelSession: ServerInferenceBackend {
+    /// Per-model resources. Everything here is dropped by `unload` and rebuilt
+    /// from `makeLoaded` when a different registered model is activated.
+    private struct LoadedModel {
+        let tokenizer: GFTokenizer
+        let model: Model
+        let runner: RealForwardRunner
+        let scratch: RawCompletionScratch
+        let promptCacheDomain: ServerPromptCacheDomain
+        let visionRuntime: VisionRuntime?
+        let visionCapability: String
+    }
+
     private let context: MetalContext
-    private let model: Model
-    private let tokenizer: GFTokenizer
-    private let runner: RealForwardRunner
-    private let scratch: RawCompletionScratch
-    private let prefillConfig: PrefillRuntimeConfig
     private let maxContext: Int
     private let promptCacheMode: ServerPromptCacheMode
-    private let promptCacheDomain: ServerPromptCacheDomain
-    private var promptCache = ServerPromptCache()
-    public nonisolated let visionCapability: String
-    private let visionRuntime: VisionRuntime?
     private let visionResidencyPolicy: VisionResidencyPolicy
+    /// Kept for the life of the process so a reload rebuilds the same runner
+    /// shape, cache domain inputs, and prefill configuration.
+    private let runtimeConfiguration: RuntimeConfiguration
+    private let modelCatalog: [String: URL]
+    private let explicitVisionPackURL: URL?
+    private let prefillConfig: PrefillRuntimeConfig
+    private var promptCache = ServerPromptCache()
+    private var loadedModel: LoadedModel?
+    private var loadedModelID: String
+    private let visionCapabilityState: Mutex<String>
+
+    /// Read without `await` from `main.swift`. Backed by a mutex because the
+    /// capability changes when a different model is activated.
+    public nonisolated var visionCapability: String {
+        visionCapabilityState.withLock { $0 }
+    }
+
+    public func currentVisionCapability() async -> String {
+        visionCapabilityState.withLock { $0 }
+    }
 
     /// What the cached KV was actually produced by. Six configuration fields
     /// plus every `TURBO_FIELDFARE_*` variable in the environment: those select
@@ -553,7 +609,39 @@ public actor ServerModelSession: ServerInferenceBackend {
                             visionPackURL: URL? = nil,
                             visionResidencyPolicy: VisionResidencyPolicy = .onDemand,
                             promptCacheMode: ServerPromptCacheMode = .singlePrefix,
-                            runtimeConfiguration: RuntimeConfiguration) async throws -> ServerModelSession {
+                            runtimeConfiguration: RuntimeConfiguration,
+                            modelCatalog: [String: URL] = [:],
+                            currentModelID: String = "") async throws -> ServerModelSession {
+        // One device for the process, reused across every reload: the old
+        // model has to be dropped before a second MetalContext could exist.
+        let context = try MetalContext()
+        let loaded = try await makeLoaded(
+            modelDirectory: modelDirectory,
+            context: context,
+            runtime: runtimeConfiguration,
+            maxContext: maxContext,
+            explicitVisionPackURL: visionPackURL)
+        return ServerModelSession(
+            context: context,
+            maxContext: maxContext,
+            promptCacheMode: promptCacheMode,
+            visionResidencyPolicy: visionResidencyPolicy,
+            runtimeConfiguration: runtimeConfiguration,
+            modelCatalog: modelCatalog,
+            explicitVisionPackURL: visionPackURL,
+            loadedModel: loaded,
+            currentModelID: currentModelID)
+    }
+
+    /// Builds every per-model resource. Shared by the initial `load` and every
+    /// later `activateModel`, so the vision rules have one implementation.
+    private static func makeLoaded(
+        modelDirectory: URL,
+        context: MetalContext,
+        runtime: RuntimeConfiguration,
+        maxContext: Int,
+        explicitVisionPackURL: URL?
+    ) async throws -> LoadedModel {
         let tokenizerFolder = GFTokenizer.tokenizerFolder(forModelDirectory: modelDirectory)
         guard let tokenizerFolder else {
             throw GFTokenizerError.missingToolTemplate
@@ -566,8 +654,6 @@ public actor ServerModelSession: ServerInferenceBackend {
             from: tokenizerFolder,
             chatStyle: GFTokenizer.manifestChatStyle(modelDirectory),
             vocabSize: GFTokenizer.manifestVocabSize(modelDirectory))
-        let context = try MetalContext()
-        let runtime = runtimeConfiguration
         let model = try Model.load(
             directoryURL: modelDirectory,
             device: context.device,
@@ -599,14 +685,14 @@ public actor ServerModelSession: ServerInferenceBackend {
         // An explicit pack path is an operator's statement that the pack is
         // there; a typo must fail loudly at startup, not serve text with vision
         // silently missing.
-        if let visionPackURL,
-           !FileManager.default.fileExists(atPath: visionPackURL.path) {
-            throw VisionPackError.packNotFound(visionPackURL.path)
+        if let explicitVisionPackURL,
+           !FileManager.default.fileExists(atPath: explicitVisionPackURL.path) {
+            throw VisionPackError.packNotFound(explicitVisionPackURL.path)
         }
         // A model directory without the .gturbo suffix has no companion
         // location; that only means vision is missing, never that a
         // text-serving load must fail.
-        let resolvedVisionPackURL = visionPackURL
+        let resolvedVisionPackURL = explicitVisionPackURL
             ?? (try? VisionPackLocation.companionURL(forTextModel: modelDirectory))
         if let hardwareCapability = Self.hardwareVisionCapability(
             supportsVisionRuntime: VisionRuntime.isSupported(on: context.device)) {
@@ -635,18 +721,13 @@ public actor ServerModelSession: ServerInferenceBackend {
             visionRuntime = nil
             visionCapability = "missing"
         }
-        return ServerModelSession(context: context,
-                                  model: model,
-                                  tokenizer: tokenizer,
-                                  runner: runner,
-                                  scratch: scratch,
-                                  prefillConfig: runtime.prefillConfig,
-                                  maxContext: maxContext,
-                                  promptCacheMode: promptCacheMode,
-                                  promptCacheDomain: promptCacheDomain,
-                                  visionRuntime: visionRuntime,
-                                  visionCapability: visionCapability,
-                                  visionResidencyPolicy: visionResidencyPolicy)
+        return LoadedModel(tokenizer: tokenizer,
+                           model: model,
+                           runner: runner,
+                           scratch: scratch,
+                           promptCacheDomain: promptCacheDomain,
+                           visionRuntime: visionRuntime,
+                           visionCapability: visionCapability)
     }
 
     static func hardwareVisionCapability(
@@ -666,30 +747,66 @@ public actor ServerModelSession: ServerInferenceBackend {
     }
 
     private init(context: MetalContext,
-                 model: Model,
-                 tokenizer: GFTokenizer,
-                 runner: RealForwardRunner,
-                 scratch: RawCompletionScratch,
-                 prefillConfig: PrefillRuntimeConfig,
                  maxContext: Int,
                  promptCacheMode: ServerPromptCacheMode,
-                 promptCacheDomain: ServerPromptCacheDomain,
-                 visionRuntime: VisionRuntime?,
-                 visionCapability: String,
-                 visionResidencyPolicy: VisionResidencyPolicy) {
+                 visionResidencyPolicy: VisionResidencyPolicy,
+                 runtimeConfiguration: RuntimeConfiguration,
+                 modelCatalog: [String: URL],
+                 explicitVisionPackURL: URL?,
+                 loadedModel: LoadedModel,
+                 currentModelID: String) {
         self.context = context
-        self.model = model
-        self.tokenizer = tokenizer
-        self.runner = runner
-        self.scratch = scratch
-        self.prefillConfig = prefillConfig
         self.maxContext = maxContext
         self.promptCacheMode = promptCacheMode
-        self.promptCacheDomain = promptCacheDomain
-        self.visionRuntime = visionRuntime
         self.visionResidencyPolicy = visionResidencyPolicy
-        self.visionCapability = visionCapability
+        self.runtimeConfiguration = runtimeConfiguration
+        self.modelCatalog = modelCatalog
+        self.explicitVisionPackURL = explicitVisionPackURL
+        self.prefillConfig = runtimeConfiguration.prefillConfig
+        self.loadedModel = loadedModel
+        self.loadedModelID = currentModelID
+        self.visionCapabilityState = Mutex(loadedModel.visionCapability)
     }
+
+    /// Drops every per-model resource but keeps the device and the
+    /// process-lifetime configuration. Called before a different model is
+    /// loaded, and again if that load fails.
+    private func unload() {
+        loadedModel = nil
+        promptCache = ServerPromptCache()
+        loadedModelID = ""
+        visionCapabilityState.withLock { $0 = "missing" }
+    }
+
+    /// Switches to a registered model. The caller (the coordinator) has already
+    /// established that nothing is admitted, preparing, or generating.
+    public func activateModel(_ id: String) async throws {
+        guard id != loadedModelID else { return }
+        guard let directory = modelCatalog[id] else {
+            throw ServerRequestError.unknownModel
+        }
+        unload()
+        let loaded = try await Self.makeLoaded(
+            modelDirectory: directory,
+            context: context,
+            runtime: runtimeConfiguration,
+            maxContext: maxContext,
+            explicitVisionPackURL: explicitVisionPackURL)
+        loadedModel = loaded
+        loadedModelID = id
+        visionCapabilityState.withLock { $0 = loaded.visionCapability }
+    }
+
+    // The coordinator activates a model before admitting any request and keeps
+    // the session idle across a swap, so every path below runs with a model
+    // loaded. These read through the loaded bundle to keep the call sites
+    // unchanged.
+    private var model: Model { loadedModel!.model }
+    private var tokenizer: GFTokenizer { loadedModel!.tokenizer }
+    private var runner: RealForwardRunner { loadedModel!.runner }
+    private var scratch: RawCompletionScratch { loadedModel!.scratch }
+    private var promptCacheDomain: ServerPromptCacheDomain { loadedModel!.promptCacheDomain }
+    private var visionRuntime: VisionRuntime? { loadedModel?.visionRuntime }
 
     public func generate(
         _ request: ValidatedChatRequest,

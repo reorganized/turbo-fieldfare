@@ -938,6 +938,43 @@ struct ServerArgumentTests {
         #expect(arguments.prefillPolicy == .chunked)
         #expect(arguments.prefillChunkTokens == 128)
         #expect(arguments.rdadvisePolicy == .off)
+        #expect(arguments.modelID == "gemma-4-26b-a4b-it")
+        #expect(arguments.models == [.init(id: "gemma-4-26b-a4b-it",
+                                           directory: "model.gturbo")])
+    }
+
+    @Test func repeatedModelRequiresMatchingModelIDs() throws {
+        #expect(throws: ServerArgumentError.self) {
+            _ = try ServerArguments.parse(["--model", "a", "--model", "b"])
+        }
+        #expect(throws: ServerArgumentError.self) {
+            _ = try ServerArguments.parse([
+                "--model", "a", "--model", "b", "--model-id", "only-a",
+            ])
+        }
+    }
+
+    @Test func repeatedModelsZipInOrder() throws {
+        let arguments = try ServerArguments.parse([
+            "--model", "a.gturbo", "--model-id", "alpha",
+            "--model", "b.gturbo", "--model-id", "beta",
+        ])
+        #expect(arguments.models == [
+            .init(id: "alpha", directory: "a.gturbo"),
+            .init(id: "beta", directory: "b.gturbo"),
+        ])
+        // Existing call sites read the first registered model.
+        #expect(arguments.model == "a.gturbo")
+        #expect(arguments.modelID == "alpha")
+    }
+
+    @Test func duplicateModelIDsAreRejected() throws {
+        #expect(throws: ServerArgumentError.self) {
+            _ = try ServerArguments.parse([
+                "--model", "a", "--model-id", "same",
+                "--model", "b", "--model-id", "same",
+            ])
+        }
     }
 
     /// The server rejected `--prefill-chunk-tokens auto` while the CLI accepted
@@ -1255,6 +1292,8 @@ struct ServerArgumentTests {
              arguments: ServerArguments(model: "model.gturbo",
                                         port: 8080,
                                         modelID: "gemma-4-26b-a4b-it",
+                                        models: [.init(id: "gemma-4-26b-a4b-it",
+                                                       directory: "model.gturbo")],
                                         maxContext: 16_384,
                                         queueLimit: 4,
                                         promptCacheMode: .singlePrefix,
@@ -1271,6 +1310,8 @@ struct ServerArgumentTests {
              arguments: ServerArguments(model: "model.gturbo",
                                         port: 8080,
                                         modelID: "gemma-4-26b-a4b-it",
+                                        models: [.init(id: "gemma-4-26b-a4b-it",
+                                                       directory: "model.gturbo")],
                                         maxContext: 16_384,
                                         queueLimit: 4,
                                         promptCacheMode: .singlePrefix,

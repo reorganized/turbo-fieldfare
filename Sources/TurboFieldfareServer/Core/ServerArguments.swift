@@ -2,9 +2,20 @@ import Foundation
 import TurboFieldfare
 
 public struct ServerArguments: Equatable, Sendable {
+    public struct RegisteredModel: Equatable, Sendable {
+        public let id: String
+        public let directory: String
+
+        public init(id: String, directory: String) {
+            self.id = id
+            self.directory = directory
+        }
+    }
+
     public let model: String
     public let port: Int
     public let modelID: String
+    public let models: [RegisteredModel]
     public let maxContext: Int
     public let queueLimit: Int
     public let promptCacheMode: ServerPromptCacheMode
@@ -24,12 +35,15 @@ public struct ServerArguments: Equatable, Sendable {
     public static let usage = """
     usage: TurboFieldfareServer --model <completed .gturbo directory> [options]
 
-      --model <dir>              Required model directory.
+      --model <dir>              Model directory. Repeatable; the first is loaded at
+                                 startup. Multiple models require one matching
+                                 --model-id each, in order.
       --vision-pack <dir>        Vision companion pack (default beside text model).
       --vision-residency <on-demand|keep-ready>
                                  Routed-expert residency during vision (default on-demand).
       --port <1...65535>         Loopback port (default 8080).
       --model-id <id>            API model identifier (default gemma-4-26b-a4b-it).
+                                 Repeatable; one per --model.
       --max-context <tokens>     4096, 8192, 16384, 32768, 65536, 98304,
                                  131072, 196608, or 262144 (default 16384).
                                  Contexts exceeding the host memory budget are refused.
@@ -93,9 +107,9 @@ public struct ServerArguments: Equatable, Sendable {
         hostMemoryBytes: UInt64 = ContextAdmission.hostMemoryBytes,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> ServerArguments {
-        var model: String?
+        var models: [String] = []
         var port = 8080
-        var modelID = "gemma-4-26b-a4b-it"
+        var modelIDs: [String] = []
         var maxContext = 16_384
         var queueLimit = 4
         var promptCacheMode: ServerPromptCacheMode = .singlePrefix
@@ -117,7 +131,7 @@ public struct ServerArguments: Equatable, Sendable {
             index += 2
             switch flag {
             case "--model":
-                model = value
+                models.append(value)
             case "--port":
                 guard let parsed = Int(value), (1...65_535).contains(parsed) else {
                     throw ServerArgumentError.invalid("--port must be between 1 and 65535")
@@ -127,7 +141,7 @@ public struct ServerArguments: Equatable, Sendable {
                 guard !value.isEmpty else {
                     throw ServerArgumentError.invalid("--model-id must not be empty")
                 }
-                modelID = value
+                modelIDs.append(value)
             case "--max-context":
                 guard let parsed = Int(value),
                       allowedMaxContext.contains(parsed) else {
@@ -204,7 +218,29 @@ public struct ServerArguments: Equatable, Sendable {
                 throw ServerArgumentError.invalid("unknown flag: \(flag)")
             }
         }
-        guard let model else { throw ServerArgumentError.invalid("--model is required") }
+        guard let firstModel = models.first else {
+            throw ServerArgumentError.invalid("--model is required")
+        }
+        let registeredModels: [RegisteredModel]
+        switch models.count {
+        case 1:
+            // Last-wins, matching today's single-model behavior.
+            registeredModels = [RegisteredModel(
+                id: modelIDs.last ?? "gemma-4-26b-a4b-it", directory: firstModel)]
+        default:
+            guard modelIDs.count == models.count else {
+                throw ServerArgumentError.invalid(
+                    "\(models.count) --model flags require \(models.count) --model-id values")
+            }
+            guard Set(modelIDs).count == modelIDs.count else {
+                throw ServerArgumentError.invalid("--model-id values must be unique")
+            }
+            registeredModels = zip(modelIDs, models).map {
+                RegisteredModel(id: $0, directory: $1)
+            }
+        }
+        let model = registeredModels[0].directory
+        let modelID = registeredModels[0].id
         // Refused here rather than at load: the KV allocation for a context the
         // host cannot back fails deep inside the runtime, after the model has
         // already started loading, with an allocator error that says nothing
@@ -223,6 +259,7 @@ public struct ServerArguments: Equatable, Sendable {
         return ServerArguments(model: model,
                                port: port,
                                modelID: modelID,
+                               models: registeredModels,
                                maxContext: maxContext,
                                queueLimit: queueLimit,
                                promptCacheMode: promptCacheMode,

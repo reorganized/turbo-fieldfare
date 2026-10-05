@@ -396,6 +396,7 @@ public struct OpenAIModelList: Codable, Equatable, Sendable {
 public enum ServerRequestError: Error, Equatable, Sendable {
     case invalid(message: String, param: String?, code: String)
     case unknownModel
+    case modelBusy
     case queueFull
 
     public var envelope: OpenAIErrorEnvelope {
@@ -405,6 +406,9 @@ public enum ServerRequestError: Error, Equatable, Sendable {
         case .unknownModel:
             OpenAIErrorEnvelope(message: "requested model is not available",
                                 param: "model", code: "model_not_found")
+        case .modelBusy:
+            OpenAIErrorEnvelope(message: "the loaded model is busy",
+                                param: "model", code: "model_busy")
         case .queueFull:
             OpenAIErrorEnvelope(message: "generation queue is full",
                                 code: "queue_full")
@@ -515,7 +519,17 @@ public enum OpenAIRequestValidator {
                          modelID: String,
                          preStagedImages: [String: ServerStagedImage],
                          attachmentLease: ServerAttachmentLease?) throws -> ValidatedChatRequest {
-        guard request.model == modelID else { throw ServerRequestError.unknownModel }
+        try validate(request,
+                     modelIDs: [modelID],
+                     preStagedImages: preStagedImages,
+                     attachmentLease: attachmentLease)
+    }
+
+    static func validate(_ request: OpenAIChatRequest,
+                         modelIDs: [String],
+                         preStagedImages: [String: ServerStagedImage],
+                         attachmentLease: ServerAttachmentLease?) throws -> ValidatedChatRequest {
+        guard modelIDs.contains(request.model) else { throw ServerRequestError.unknownModel }
         guard request.n == nil || request.n == 1 else {
             throw invalid("only n=1 is supported", "n", "unsupported_value")
         }

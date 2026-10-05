@@ -7,9 +7,14 @@ import Testing
 
 private actor ScriptedServerBackend: ServerInferenceBackend {
     let delayNanoseconds: UInt64
+    private(set) var activatedIDs: [String] = []
 
     init(delayNanoseconds: UInt64 = 0) {
         self.delayNanoseconds = delayNanoseconds
+    }
+
+    func activateModel(_ id: String) async throws {
+        activatedIDs.append(id)
     }
 
     func generate(
@@ -77,12 +82,17 @@ private actor ContentAndToolBackend: ServerInferenceBackend {
 private actor PipelinedRequestBackend: ServerInferenceBackend {
     private var continuation: CheckedContinuation<Void, Never>?
     private(set) var generationCount = 0
+    private(set) var activatedIDs: [String] = []
 
     var isWaiting: Bool { continuation != nil }
 
     func release() {
         continuation?.resume()
         continuation = nil
+    }
+
+    func activateModel(_ id: String) async throws {
+        activatedIDs.append(id)
     }
 
     func generate(
@@ -492,6 +502,95 @@ struct HTTPServerTests {
         let (data, response) = try await URLSession.shared.data(for: request)
         #expect((response as? HTTPURLResponse)?.statusCode == 404)
         #expect(String(decoding: data, as: UTF8.self).contains("model_not_found"))
+
+        try await server.shutdown()
+    }
+
+    @Test func modelsListsEveryKnownModel() async throws {
+        let server = TurboFieldfareHTTPServer(
+            modelID: "test-model",
+            queueLimit: 1,
+            backend: ScriptedServerBackend(),
+            knownModelIDs: ["test-model", "second-model"])
+        let channel = try await server.start(port: 0)
+        let port = try #require(channel.localAddress?.port)
+        let data = try await URLSession.shared.data(
+            from: URL(string: "http://127.0.0.1:\(port)/v1/models")!).0
+        let text = String(decoding: data, as: UTF8.self)
+        #expect(text.contains("test-model"))
+        #expect(text.contains("second-model"))
+
+        try await server.shutdown()
+    }
+
+    @Test func idleRequestSwitchesToSecondKnownModel() async throws {
+        let backend = ScriptedServerBackend()
+        let server = TurboFieldfareHTTPServer(
+            modelID: "test-model",
+            queueLimit: 1,
+            backend: backend,
+            knownModelIDs: ["test-model", "second-model"])
+        let channel = try await server.start(port: 0)
+        let port = try #require(channel.localAddress?.port)
+        var request = URLRequest(
+            url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.httpBody = Data(#"""
+        {"model":"second-model","messages":[{"role":"user","content":"hi"}]}
+        """#.utf8)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        #expect((response as? HTTPURLResponse)?.statusCode == 200)
+        #expect(String(decoding: data, as: UTF8.self).contains(#""model":"second-model""#))
+        #expect(await backend.activatedIDs == ["second-model"])
+
+        try await server.shutdown()
+    }
+
+    @Test func busyServerRejectsSecondModelSwitch() async throws {
+        let backend = PipelinedRequestBackend()
+        let server = TurboFieldfareHTTPServer(
+            modelID: "model-a",
+            queueLimit: 4,
+            backend: backend,
+            knownModelIDs: ["model-a", "model-b"])
+        let channel = try await server.start(port: 0)
+        let port = try #require(channel.localAddress?.port)
+        let firstSocket = try connectedSocket(port: port)
+        let secondSocket = try connectedSocket(port: port)
+        defer {
+            Darwin.close(firstSocket)
+            Darwin.close(secondSocket)
+        }
+
+        try writeAll(socket: firstSocket, text: httpRequest(
+            port: port,
+            body: #"{"model":"model-a","messages":[{"role":"user","content":"first"}]}"#,
+            connection: "close"))
+        let deadline = ContinuousClock.now + .seconds(2)
+        while await !backend.isWaiting, ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        #expect(await backend.isWaiting)
+
+        try writeAll(socket: secondSocket, text: httpRequest(
+            port: port,
+            body: #"{"model":"model-b","messages":[{"role":"user","content":"second"}]}"#,
+            connection: "close"))
+        let rejected = try readUntil(
+            socket: secondSocket,
+            timeoutMilliseconds: 2_000,
+            condition: { $0.contains(#""code":"model_busy""#) })
+        #expect(rejected.contains("HTTP/1.1 409 Conflict"))
+        #expect(await backend.activatedIDs.isEmpty)
+
+        await backend.release()
+        let completed = try readUntil(
+            socket: firstSocket,
+            timeoutMilliseconds: 2_000,
+            condition: { $0.contains(#""content":"first""#) })
+        #expect(completed.contains("HTTP/1.1 200 OK"))
+        #expect(await backend.generationCount == 1)
 
         try await server.shutdown()
     }

@@ -1,8 +1,8 @@
 # Local OpenAI-compatible server
 
-`TurboFieldfareServer` exposes a local Chat Completions API for one Gemma
-model. It binds to `127.0.0.1` without authentication or TLS. Do not expose it
-through a proxy or tunnel.
+`TurboFieldfareServer` exposes a local Chat Completions API for one or more
+registered models, one loaded at a time. It binds to `127.0.0.1` without
+authentication or TLS. Do not expose it through a proxy or tunnel.
 
 ## Start the server
 
@@ -23,9 +23,26 @@ swift build -c release --product TurboFieldfareServer
   --max-context 16384
 ```
 
-The server loads the model before opening the port. Wait for
+The server loads the first `--model` before opening the port. Wait for
 `TurboFieldfareServer ready`, then keep the process running while clients use
 it.
+
+Pass `--model` and `--model-id` more than once to register several models. The
+first pair is loaded at startup; the ids are matched in order:
+
+```bash
+.build/release/TurboFieldfareServer \
+  --model scratch/gemma4.gturbo --model-id gemma-4-26b-a4b-it \
+  --model scratch/gemma4-alt.gturbo --model-id gemma-alt \
+  --port 8080
+```
+
+`GET /v1/models` lists every registered id. A completion for a registered id
+that is not loaded switches the server to it while no request is admitted,
+preparing, or generating; the previous model is unloaded first, so only one
+model is in memory at a time. If a generation is in flight, the switch is
+refused with HTTP 409 and code `model_busy` rather than disturbing it. An id
+that was never registered returns the usual 404 `model_not_found`.
 
 Check the server from another terminal:
 
@@ -240,9 +257,11 @@ ignored. A top-level field set to `null` is treated as absent. Fields inside
 `stream_options` only `include_usage` is read, so a misspelled key there is
 ignored rather than refused.
 
-The server supports one model and one choice. It does not support the Responses
+The server supports one loaded model at a time and one choice per request. It
+does not support the Responses
 API, legacy Completions, embeddings, structured output,
-batching, log probabilities, or remote model switching.
+batching, or log probabilities. Multiple registered models are switched when
+idle as described above, but only one is resident.
 
 Context length can be 4K, 8K, 16K, 32K, 64K, 96K, 128K, 192K, or 256K.
 The default is 16K. Before loading the model, the server checks whether the

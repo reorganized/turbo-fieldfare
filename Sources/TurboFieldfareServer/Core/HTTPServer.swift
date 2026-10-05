@@ -16,11 +16,10 @@ public actor TurboFieldfareHTTPServer {
     public static let idleTimeout = TimeAmount.seconds(120)
 
     private let group: MultiThreadedEventLoopGroup
-    private let modelID: String
     private let backend: any ServerInferenceBackend
     private let coordinator: ServerCoordinator
     private let heartbeatInterval: TimeAmount
-    private let visionCapability: String
+    private let modelState: ModelState
     private let attachmentRoot: URL
     private let idleTimeout: TimeAmount
     private let childChannels = ChildChannelRegistry()
@@ -32,27 +31,29 @@ public actor TurboFieldfareHTTPServer {
                 backend: any ServerInferenceBackend,
                 heartbeatInterval: TimeAmount = .seconds(5),
                 visionCapability: String = "missing",
+                knownModelIDs: [String] = [],
                 attachmentRoot: URL = ServerAttachmentDirectory.root,
                 idleTimeout: TimeAmount = TurboFieldfareHTTPServer.idleTimeout,
                 group: MultiThreadedEventLoopGroup = .init(numberOfThreads: 1)) {
         self.group = group
-        self.modelID = modelID
         self.backend = backend
-        self.coordinator = ServerCoordinator(queueLimit: queueLimit)
+        self.coordinator = ServerCoordinator(queueLimit: queueLimit, currentModelID: modelID)
         self.heartbeatInterval = heartbeatInterval
-        self.visionCapability = visionCapability
+        self.modelState = ModelState(
+            knownModelIDs: knownModelIDs.isEmpty ? [modelID] : knownModelIDs,
+            currentID: modelID,
+            vision: visionCapability)
         self.attachmentRoot = attachmentRoot
         self.idleTimeout = idleTimeout
         ServerAttachmentDirectory.sweepAbandoned(in: attachmentRoot)
     }
 
     public func start(port: Int) async throws -> Channel {
-        let modelID = self.modelID
         let backend = self.backend
         let coordinator = self.coordinator
         let heartbeatInterval = self.heartbeatInterval
         let childChannels = self.childChannels
-        let visionCapability = self.visionCapability
+        let modelState = self.modelState
         let attachmentRoot = self.attachmentRoot
         let idleTimeout = self.idleTimeout
         let bootstrap = ServerBootstrap(group: group)
@@ -73,11 +74,10 @@ public actor TurboFieldfareHTTPServer {
                         withErrorHandling: true)
                 }.flatMap {
                     channel.pipeline.addHandler(ServerHTTPHandler(
-                        modelID: modelID,
                         backend: backend,
                         coordinator: coordinator,
                         heartbeatInterval: heartbeatInterval,
-                        visionCapability: visionCapability,
+                        modelState: modelState,
                         attachmentRoot: attachmentRoot,
                         childChannels: childChannels))
                 }
@@ -143,12 +143,11 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
-    private let modelID: String
     private let backend: any ServerInferenceBackend
     private let coordinator: ServerCoordinator
     private let heartbeatInterval: TimeAmount
     private let childChannels: ChildChannelRegistry
-    private let visionCapability: String
+    private let modelState: ModelState
     private let attachmentRoot: URL
     private var bodyParser: StreamingChatRequestBody?
     private var bodyError: (any Error)?
@@ -163,18 +162,16 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
     private var head: HTTPRequestHead?
     private var activeTask: Task<Void, Never>?
 
-    init(modelID: String,
-         backend: any ServerInferenceBackend,
+    init(backend: any ServerInferenceBackend,
          coordinator: ServerCoordinator,
          heartbeatInterval: TimeAmount,
-         visionCapability: String,
+         modelState: ModelState,
          attachmentRoot: URL,
          childChannels: ChildChannelRegistry) {
-        self.modelID = modelID
         self.backend = backend
         self.coordinator = coordinator
         self.heartbeatInterval = heartbeatInterval
-        self.visionCapability = visionCapability
+        self.modelState = modelState
         self.attachmentRoot = attachmentRoot
         self.childChannels = childChannels
     }
@@ -204,7 +201,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
             // elsewhere is counted and dropped.
             bodyParser = Self.carriesChatBody(head)
                 ? StreamingChatRequestBody(attachmentRoot: attachmentRoot,
-                                           visionCapability: visionCapability)
+                                           visionCapability: modelState.vision)
                 : nil
             bodyError = nil
             receivedBodyBytes = 0
@@ -299,17 +296,21 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
         case (.GET, "/health"):
             writeJSON(context, status: .ok, object: [
                 "status": "ok",
-                "vision": visionCapability,
+                "vision": modelState.vision,
             ])
         case (.GET, "/v1/models"):
+            let currentID = modelState.currentID
+            let currentVision = modelState.vision
             let response = OpenAIModelList(
                 object: "list",
-                data: [.init(id: modelID,
-                             object: "model",
-                             created: 0,
-                             ownedBy: "turbofieldfare",
-                             capabilities: visionCapability == "ready"
-                                ? ["text", "image"] : ["text"])])
+                data: modelState.knownModelIDs.map { id in
+                    .init(id: id,
+                          object: "model",
+                          created: 0,
+                          ownedBy: "turbofieldfare",
+                          capabilities: id == currentID && currentVision == "ready"
+                             ? ["text", "image"] : ["text"])
+                })
             writeCodable(context, status: .ok, response)
         case (.POST, "/v1/chat/completions"):
             guard head.headers.first(name: "content-type")?
@@ -337,9 +338,10 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
             let decoded = try JSONDecoder().decode(OpenAIChatRequest.self, from: body.json)
             let request = try OpenAIRequestValidator.validate(
                 decoded,
-                modelID: modelID,
+                modelIDs: modelState.knownModelIDs,
                 preStagedImages: body.stagedImages,
                 attachmentLease: body.lease)
+            let requestedModel = decoded.model
             let responseID = "chatcmpl-" + UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: "")
             let created = Int(Date().timeIntervalSince1970)
             let contextBox = SendableContext(context)
@@ -355,6 +357,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                 let future = self.beginStream(
                     contextBox.value,
                     self.chunk(id: responseID, created: created,
+                               modelID: requestedModel,
                                delta: ["role": "assistant"],
                                finishReason: nil))
                 streamState.setStartFuture(future)
@@ -379,9 +382,15 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                 ServerLog.accepted(id: responseID, streaming: request.stream)
                 do {
                     let completion = try await self.coordinator.runPreparing(
+                        requestedModel: requestedModel,
+                        activate: { id in
+                            try await self.backend.activateModel(id)
+                            self.modelState.set(
+                                id, await self.backend.currentVisionCapability())
+                        },
                         onQueued: onQueued,
                         prepare: {
-                            let prepared = try await self.backend.prepare(request)
+                            let prepared: ServerPreparedRequest = try await self.backend.prepare(request)
                             phaseState.set("prepared")
                             ServerLog.prepared(id: responseID,
                                                promptTokens: prepared.promptTokenCount)
@@ -401,12 +410,14 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                                     self.writeStreamChunk(
                                         contextBox.value,
                                         self.chunk(id: responseID, created: created,
+                                                   modelID: requestedModel,
                                                    delta: ["content": text],
                                                    finishReason: nil))
                                 case .toolCall(let call):
                                     self.writeToolCall(contextBox.value,
                                                        id: responseID,
                                                        created: created,
+                                                       modelID: requestedModel,
                                                        toolIndex: streamState.nextToolIndex(),
                                                        call: call)
                                 }
@@ -420,12 +431,14 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                         self.finishStream(contextBox.value,
                                           id: responseID,
                                           created: created,
+                                          modelID: requestedModel,
                                           completion: completion,
                                           includeUsage: request.includeUsage)
                     } else {
                         self.writeCompletion(contextBox.value,
                                              id: responseID,
                                              created: created,
+                                             modelID: requestedModel,
                                              completion: completion)
                     }
                 } catch {
@@ -452,6 +465,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
     private func writeCompletion(_ context: ChannelHandlerContext,
                                  id: String,
                                  created: Int,
+                                 modelID: String,
                                  completion: ServerCompletion) {
         let encodedContent: Any =
             completion.content.isEmpty && !completion.toolCalls.isEmpty
@@ -513,6 +527,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
     private func writeToolCall(_ context: ChannelHandlerContext,
                                id: String,
                                created: Int,
+                               modelID: String,
                                toolIndex: Int,
                                call: ParsedToolCall) {
         let fragments = utf8Fragments(call.argumentsJSON, maximumBytes: 1024)
@@ -528,6 +543,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
             writeStreamChunk(
                 context,
                 chunk(id: id, created: created,
+                      modelID: modelID,
                       delta: ["tool_calls": [tool]],
                       finishReason: nil))
         }
@@ -536,11 +552,13 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
     private func finishStream(_ context: ChannelHandlerContext,
                               id: String,
                               created: Int,
+                              modelID: String,
                               completion: ServerCompletion,
                               includeUsage: Bool) {
         writeStreamChunk(
             context,
             chunk(id: id, created: created,
+                  modelID: modelID,
                   delta: [:],
                   finishReason: completion.finishReason))
         if includeUsage {
@@ -563,6 +581,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
 
     private func chunk(id: String,
                        created: Int,
+                       modelID: String,
                        delta: [String: Any],
                        finishReason: String?) -> [String: Any] {
         let encodedReason: Any = finishReason.map { $0 as Any } ?? NSNull()
@@ -762,6 +781,8 @@ private extension ServerRequestError {
         switch self {
         case .unknownModel:
             .notFound
+        case .modelBusy:
+            .conflict
         case .queueFull:
             .tooManyRequests
         case .invalid(_, _, let code):
@@ -771,6 +792,34 @@ private extension ServerRequestError {
             default:
                 .badRequest
             }
+        }
+    }
+}
+
+/// The currently loaded model and its vision capability, shared with every
+/// connection handler so a keep-alive connection sees a swap rather than the
+/// startup values it captured. `knownModelIDs` is immutable.
+private final class ModelState: Sendable {
+    private struct State {
+        var currentID: String
+        var vision: String
+    }
+
+    let knownModelIDs: [String]
+    private let state: Mutex<State>
+
+    init(knownModelIDs: [String], currentID: String, vision: String) {
+        self.knownModelIDs = knownModelIDs
+        self.state = Mutex(State(currentID: currentID, vision: vision))
+    }
+
+    var currentID: String { state.withLock { $0.currentID } }
+    var vision: String { state.withLock { $0.vision } }
+
+    func set(_ id: String, _ vision: String) {
+        state.withLock {
+            $0.currentID = id
+            $0.vision = vision
         }
     }
 }
