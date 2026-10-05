@@ -1044,6 +1044,15 @@ public actor ServerModelSession: ServerInferenceBackend {
                 renderedPromptIDs: renderedTextIDs,
                 tokenizer: tokenizer)
         }
+        // The cached KV keeps every earlier Qwen reasoning span, which a fresh
+        // render drops. When resuming would leave no room to answer and the
+        // fresh render is shorter, render fresh: the cache must never refuse
+        // what an uncached request would serve.
+        if case .hit(let effective, _) = cacheMatch, let renderedTextIDs,
+           renderedTextIDs.count < effective.count,
+           effective.count + ConversationGenerationReserve.tokens > maxContext {
+            cacheMatch = .miss(.noRoom)
+        }
         let effectivePromptIDs: [Int32]
         let completionStart: RawCompletionStart
         var multimodalInput: MultimodalPrefillInput?

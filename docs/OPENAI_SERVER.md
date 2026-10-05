@@ -250,6 +250,11 @@ Supported options include `temperature`, `top_p`, `top_k`,
 `repetition_penalty`, `seed`, `stop`, `max_tokens`,
 `max_completion_tokens`, and function-tool fields.
 
+Qwen3.6 always thinks before it answers. The server does not return the
+reasoning, and `stop` strings do not match inside it, but it counts toward
+`completion_tokens` and the token limit. Leave room for it in `max_tokens`; the
+first visible content arrives only after the reasoning ends.
+
 Unknown top-level request fields return HTTP 400 with `code`
 `unknown_parameter` and the field name in `param`, so a misspelled option is
 refused rather than silently ignored. `response_format` is accepted only as

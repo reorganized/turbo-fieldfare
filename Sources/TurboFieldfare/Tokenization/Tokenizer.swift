@@ -360,9 +360,12 @@ public struct GFTokenizer: @unchecked Sendable {
     /// `clean_up_tokenization_spaces` pass defaults to on for this tokenizer and
     /// rewrites model output (`"he said ' ok ' now"` -> `"he said'ok'now"`),
     /// breaking `decode(encode(x)) == x`. Batch decode is a push-loop over
-    /// `GFDetokenizer`, so batch and streaming decode agree by construction.
+    /// `GFDetokenizer`, so batch and streaming decode agree by construction;
+    /// Qwen takes the same ByteLevel path as streaming.
     public func decode(_ ids: [Int32], skipSpecialTokens: Bool = true) -> String {
-        var detok = GFDetokenizer(tokenizer: self, skipSpecialTokens: skipSpecialTokens)
+        var detok = GFDetokenizer(tokenizer: self,
+                                  skipSpecialTokens: skipSpecialTokens,
+                                  plainDecode: chatStyle == .qwenImStart)
         var text = ""
         for id in ids {
             text += detok.push(id)
@@ -435,8 +438,9 @@ public struct GFTokenizer: @unchecked Sendable {
     public func applyChatTemplate(_ messages: [Message]) throws -> String {
         if chatStyle == .qwenImStart {
             // Render through the installed chat_template.jinja sidecar
-            // (add_generation_prompt; thinking disabled). Fail closed when
-            // the sidecar carries no template.
+            // (add_generation_prompt; thinking enabled, so the prompt ends
+            // inside `<think>` and `runRawCompletion` hides the reasoning).
+            // Fail closed when the sidecar carries no template.
             guard tokenizer.hasChatTemplate else {
                 throw GFTokenizerError.missingToolTemplate
             }
@@ -468,7 +472,7 @@ public struct GFTokenizer: @unchecked Sendable {
                 truncation: false,
                 maxLength: nil,
                 tools: nil,
-                additionalContext: ["enable_thinking": false])
+                additionalContext: ["enable_thinking": true])
             return tokenizer.decode(tokens: renderedTokens, skipSpecialTokens: false)
         }
         var s = Self.bosMark
@@ -530,19 +534,22 @@ public struct GFTokenizer: @unchecked Sendable {
             truncation: false,
             maxLength: nil,
             tools: upstreamTools,
-            additionalContext: ["enable_thinking": false]
+            // Qwen always thinks; Gemma's tool template keeps its thought
+            // channel closed as before.
+            additionalContext: ["enable_thinking": chatStyle == .qwenImStart]
         ).map(Int32.init)
     }
 
     public func encodeTextContinuation(userContent: String) -> [Int32] {
         let content = userContent.trimmingCharacters(in: .whitespacesAndNewlines)
         if chatStyle == .qwenImStart {
-            // Close the previous assistant turn, then render the next user
-            // turn + generation prompt through the jinja template.
+            // Close the previous assistant turn (`<|im_end|>\n`, as the
+            // template writes it), then render the next user turn +
+            // generation prompt through the jinja template.
             let rendered = (try? self.applyChatTemplate([
                 Message(role: .user, content: content),
             ])) ?? ""
-            return [endOfTurnID] + encode(rendered, addBOS: false)
+            return [endOfTurnID] + encode("\n" + rendered, addBOS: false)
         }
         return [endOfTurnID] + encode(
             "\n\(Self.turnOpen)user\n\(content)\(Self.turnClose)\n"
@@ -586,7 +593,7 @@ public struct GFTokenizer: @unchecked Sendable {
                 truncation: false,
                 maxLength: nil,
                 tools: nil,
-                additionalContext: ["enable_thinking": false]
+                additionalContext: ["enable_thinking": true]
             ).map(Int32.init)
         }
         return encode(try applyChatTemplate(messages), addBOS: false)
@@ -691,6 +698,10 @@ public struct GFTokenizer: @unchecked Sendable {
         incomingMessages: [Message],
         tools: [FunctionDefinition]
     ) throws -> [Int32] {
+        if chatStyle == .qwenImStart {
+            return try encodeQwenToolResultContinuation(
+                incomingMessages: incomingMessages, tools: tools)
+        }
         let prefix = try encodeToolChat(
             messages: cachedMessages + [assistant],
             tools: tools)
@@ -725,6 +736,33 @@ public struct GFTokenizer: @unchecked Sendable {
                 "tool-result continuation does not begin at the KV boundary")
         }
         return suffix
+    }
+
+    /// Qwen writes its calls as text and ends the turn with `<|im_end|>`, so
+    /// the KV boundary is that token and the cached turn has no marker to
+    /// slice at. The template wraps the trailing tool results in one user
+    /// turn, which is the second-to-last `<|im_start|>` of the full render
+    /// (the last opens the generation prompt); the bridge runs from the
+    /// `<|im_end|>` that closes the assistant turn before it.
+    private func encodeQwenToolResultContinuation(
+        incomingMessages: [Message],
+        tools: [FunctionDefinition]
+    ) throws -> [Int32] {
+        let full = try encodeToolChat(messages: incomingMessages, tools: tools)
+        let imStartID = try Self.requireTokenID(tokenizer, "<|im_start|>")
+        let starts = full.indices.filter { full[$0] == imStartID }
+        guard starts.count >= 2,
+              let close = full[..<starts[starts.count - 2]].lastIndex(of: endOfTurnID) else {
+            throw GFTokenizerError.invalidChatTemplate(
+                "cached assistant turn boundary is missing")
+        }
+        let bridge = Array(full[close...])
+        guard decode(bridge, skipSpecialTokens: false)
+            .hasPrefix("<|im_end|>\n<|im_start|>user\n<tool_response>") else {
+            throw GFTokenizerError.invalidChatTemplate(
+                "tool-result continuation does not begin at the KV boundary")
+        }
+        return bridge
     }
 }
 

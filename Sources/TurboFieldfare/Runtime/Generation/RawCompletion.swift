@@ -303,6 +303,7 @@ public func runRawCompletion(producer: any LogitProducer,
     var detok = GFDetokenizer(tokenizer: tokenizer,
                               barrierTokenIDs: tokenizer.structuralMarkerIDs,
                               plainDecode: tokenizer.chatStyle == .qwenImStart)
+    var thinking = QwenThinkingFilter(tokenizer: tokenizer, promptIds: promptIds)
 
     if let context = producer as? any ContextWindowReporting,
        promptIds.count + config.maxNewTokens > context.maxContext {
@@ -364,12 +365,16 @@ public func runRawCompletion(producer: any LogitProducer,
             } else {
                 reason = .eos
             }
-            let tail = stopMatcher.push(detok.flush()) + stopMatcher.finish()
+            let tail = stopMatcher.push(thinking.push(detok.flush())) + stopMatcher.finish()
             if !tail.isEmpty { onProgress(.tail(tail)) }
             break
         }
 
-        let delta = detok.push(tokenID)
+        let text = detok.push(tokenID)
+        let delta = thinking.push(text)
+        // Reasoning the filter hid is not text the stop matcher withheld, so
+        // it must not count toward `withheldTrailingKVTokens`.
+        let hidden = !text.isEmpty && delta.isEmpty
         let visible = stopMatcher.push(delta)
         onProgress(.token(index: generated - 1, id: tokenID, delta: visible))
 
@@ -382,14 +387,14 @@ public func runRawCompletion(producer: any LogitProducer,
         let hitMax = generated >= config.maxNewTokens
         if hitStopString || cancelled || hitMax {
             if !visible.isEmpty { trailingInvisibleTokens = 0 }
-            let tail = stopMatcher.push(detok.flush()) + stopMatcher.finish()
+            let tail = stopMatcher.push(thinking.push(detok.flush())) + stopMatcher.finish()
             if !tail.isEmpty { onProgress(.tail(tail)) }
             reason = hitStopString ? .stopString : (cancelled ? .cancelled : .maxTokens)
             break
         }
 
         history.append(tokenID)
-        trailingInvisibleTokens = visible.isEmpty ? trailingInvisibleTokens + 1 : 0
+        trailingInvisibleTokens = visible.isEmpty && !hidden ? trailingInvisibleTokens + 1 : 0
         try await producer.produce(token: tokenID, position: position, into: scratch.logits)
         position += 1
         uncommittedBoundaryTokenIDs.removeAll(keepingCapacity: true)
@@ -407,6 +412,52 @@ public func runRawCompletion(producer: any LogitProducer,
                            uncommittedBoundaryTokenIDs: uncommittedBoundaryTokenIDs,
                            withheldTrailingKVTokens: reason == .stopString
                                ? trailingInvisibleTokens : 0)
+}
+
+/// Hides Qwen3.6 reasoning. With thinking enabled the prompt ends inside
+/// `<think>`, so generation opens with reasoning that runs to `</think>`; that
+/// span and the newlines after it (the template's `lstrip('\n')`) never reach
+/// visible text. The tokens stay
+/// in the KV and in `kvBackedTokenIDs`. Inactive for every other prompt,
+/// including a raw Qwen prompt that never opened a think block.
+struct QwenThinkingFilter {
+    private static let close = "</think>"
+    private var thinking: Bool
+    private var trimLeading = false
+    private var held = ""
+
+    init(active: Bool) {
+        thinking = active
+    }
+
+    init(tokenizer: GFTokenizer, promptIds: [Int32]) {
+        guard tokenizer.chatStyle == .qwenImStart else {
+            self.init(active: false)
+            return
+        }
+        let tail = tokenizer.decode(Array(promptIds.suffix(3)), skipSpecialTokens: false)
+        self.init(active: tail.hasSuffix("<think>\n") || tail.hasSuffix("<think>"))
+    }
+
+    mutating func push(_ text: String) -> String {
+        if thinking {
+            held += text
+            guard let end = held.range(of: Self.close) else {
+                // Keep only what could still complete the closing tag.
+                held = String(held.suffix(Self.close.count - 1))
+                return ""
+            }
+            let rest = String(held[end.upperBound...])
+            held = ""
+            thinking = false
+            trimLeading = true
+            return push(rest)
+        }
+        guard trimLeading else { return text }
+        let rest = text.drop(while: \.isNewline)
+        if !rest.isEmpty { trimLeading = false }
+        return String(rest)
+    }
 }
 
 private func sampleOnce(scratch: RawCompletionScratch, context: MetalContext,

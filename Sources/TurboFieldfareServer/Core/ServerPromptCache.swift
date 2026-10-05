@@ -48,6 +48,7 @@ enum ServerPromptCacheMissReason: String, Sendable, Equatable {
     case bridgeRenderFailed = "bridge-render-failed"
     case missingImageIdentity = "missing-image-identity"
     case imagesDiverged = "images-diverged"
+    case noRoom = "no-room"
 }
 
 enum ServerPromptCacheMatch: Sendable, Equatable {
@@ -262,7 +263,10 @@ struct ServerPromptCache: Sendable {
         tokenizer: GFTokenizer
     ) -> ServerPromptCacheMatch {
         let calls = entry.assistantTurn.message.toolCalls
-        guard entry.assistantTurn.rawStopReason == .toolCalls,
+        // Gemma stops on its tool-response marker; Qwen writes calls as text
+        // and ends the turn with `<|im_end|>`.
+        let expectedStop: StopReason = tokenizer.chatStyle == .qwenImStart ? .endOfTurn : .toolCalls
+        guard entry.assistantTurn.rawStopReason == expectedStop,
               continuation.count == calls.count,
               zip(continuation, calls).allSatisfy({ message, call in
                   message.role == .tool
