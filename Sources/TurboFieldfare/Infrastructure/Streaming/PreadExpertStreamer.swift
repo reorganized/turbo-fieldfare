@@ -276,6 +276,14 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         precondition(plan.assignedSlots.count == plan.experts.count,
                      "expert cache plan slot count mismatch")
 
+        let statsStart = ExpertIOStats.enabled ? DispatchTime.now().uptimeNanoseconds : 0
+        defer {
+            if ExpertIOStats.enabled {
+                ExpertIOStats.record(hits: plan.experts.count - plan.misses.count,
+                                     misses: plan.misses.count,
+                                     nanos: DispatchTime.now().uptimeNanoseconds - statsStart)
+            }
+        }
         let errorLock = NSLock()
         nonisolated(unsafe) var firstError: Error?
         DispatchQueue.concurrentPerform(iterations: plan.misses.count) { missOffset in
@@ -419,5 +427,40 @@ public final class PreadExpertStreamer: @unchecked Sendable {
     /// ownership or lifetime API.
     public var diagnosticSlotScratchBytes: UInt64 {
         UInt64(slotCount) * UInt64(slotAllocationSize)
+    }
+}
+
+
+/// Experiment-only expert I/O counters, enabled by TURBO_EXPERT_STATS.
+public enum ExpertIOStats {
+    public static let enabled = ProcessInfo.processInfo.environment["TURBO_EXPERT_STATS"] != nil
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var hits = 0
+    nonisolated(unsafe) private static var misses = 0
+    nonisolated(unsafe) private static var fetchNanos: UInt64 = 0
+    nonisolated(unsafe) private static var syncNanos: UInt64 = 0
+    nonisolated(unsafe) private static var gpuSeconds: [String: Double] = [:]
+
+    public static func recordGPU(_ label: String, _ cb: MTLCommandBuffer) {
+        let dt = cb.gpuEndTime - cb.gpuStartTime
+        guard dt > 0 else { return }
+        add(label, dt)
+    }
+
+    public static func add(_ label: String, _ value: Double) {
+        lock.lock(); gpuSeconds[label, default: 0] += value; lock.unlock()
+    }
+
+    static func record(hits h: Int, misses m: Int, nanos: UInt64) {
+        lock.lock(); hits += h; misses += m; fetchNanos += nanos; lock.unlock()
+    }
+
+    public static func recordSync(nanos: UInt64) {
+        lock.lock(); syncNanos += nanos; lock.unlock()
+    }
+
+    public static func report() -> String {
+        lock.lock(); defer { lock.unlock() }
+        return "[expert-io hits=\(hits) misses=\(misses) fetch=\(String(format: "%.2f", Double(fetchNanos) / 1e9))s cb1-wait=\(String(format: "%.2f", Double(syncNanos) / 1e9))s gpu=\(gpuSeconds.sorted { $0.key < $1.key }.map { "\($0.key):\(String(format: "%.2f", $0.value))s" }.joined(separator: ","))]"
     }
 }

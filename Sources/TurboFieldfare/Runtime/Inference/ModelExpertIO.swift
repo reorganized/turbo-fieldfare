@@ -123,6 +123,16 @@ extension Model {
         }
     }
 
+    /// Warms `experts` into the layer's slot cache in the background; join with `group.wait()`
+    /// before the layer's own fetch.
+    public func prefetchRoutedExperts(layer: Int, experts: [Int], group: DispatchGroup) throws {
+        try ensureLayerOpened(layer)
+        let streamer = streamersQueue.sync { streamersBox.streamers[layer]! }
+        DispatchQueue.global(qos: .userInitiated).async(group: group) {
+            _ = try? streamer.loadExpertsCached(experts: experts)
+        }
+    }
+
     public func fetchRoutedExperts(layer: Int, experts: [Int]) async throws -> [TensorView] {
         try ensureLayerOpened(layer)
         let streamer = streamersQueue.sync { streamersBox.streamers[layer]! }

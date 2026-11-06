@@ -286,6 +286,9 @@ public func run(args: Args,
                 : 0
             let footer = "\n[stop=\(String(describing: stats.reason)) prefill=\(stats.prefillTokens)tok new=\(stats.newTokens)tok decode=\(String(format: "%.2f", stats.decodeSeconds))s tok/s=\(String(format: "%.3f", tokensPerSecond))]\n"
             stderr.write(Data(footer.utf8))
+            if ExpertIOStats.enabled {
+                stderr.write(Data((ExpertIOStats.report() + "\n").utf8))
+            }
         }
         return RunResult(exitCode: 0)
     } catch let error as ArgsError {

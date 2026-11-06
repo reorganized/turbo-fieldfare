@@ -195,6 +195,13 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
     private let zeroResidual: MTLBuffer  // [D] FP16 zeros — for routed branch base
     private let outIndices: MTLBuffer    // [topK] UInt32
     private let outWeights: MTLBuffer    // [topK] FP16
+    // Qwen decode predicts layer L+1's experts by running L+1's router on L's
+    // post-attention residual, then reads them in the background. About 81%
+    // of guesses hit; output is unchanged. TURBO_QWEN_PREFETCH=0 disables it.
+    private let predIndices: MTLBuffer
+    private let predWeights: MTLBuffer
+    private let predNormed: MTLBuffer
+    private static let qwenPrefetch = ProcessInfo.processInfo.environment["TURBO_QWEN_PREFETCH"] != "0"
     // Persistent MoE scratch, allocated once; about 56 KiB at production shape.
     private let moeActs: MTLBuffer       // [topK * FmoE] FP16
     private let moeHitActiveSlots: MTLBuffer // [topK] UInt32
@@ -342,6 +349,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
         memset(self.zeroResidual.contents(), 0, self.zeroResidual.length)
         self.outIndices    = try buf(cfg.topKExperts, MemoryLayout<UInt32>.size)
         self.outWeights    = try buf(cfg.topKExperts)
+        self.predIndices   = try buf(cfg.topKExperts, MemoryLayout<UInt32>.size)
+        self.predWeights   = try buf(cfg.topKExperts)
+        self.predNormed    = try buf(D)
         self.moeActs       = try buf(cfg.topKExperts * cfg.moeIntermediateSize)
         self.moeHitActiveSlots = try buf(cfg.topKExperts, MemoryLayout<UInt32>.size)
         self.moeMissActiveSlots = try buf(cfg.topKExperts, MemoryLayout<UInt32>.size)
@@ -2687,6 +2697,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
     // (CPU readback of indices), shared-expert CB overlapped with the routed
     // blob pread, then the routed CB whose tail feeds the next layer's CB1.
 
+    private static func waitGroup(_ group: DispatchGroup) { group.wait() }
+
     private func produceTokenQwen(token: Int32,
                                   position: Int,
                                   into logits: MTLBuffer,
@@ -2727,6 +2739,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                 try checkCommandBufferError(p.sharedCB)
                 if wait { waitUntilCompleted(p.cb) }
                 try checkCommandBufferError(p.cb)
+                if ExpertIOStats.enabled {
+                    ExpertIOStats.recordGPU("shared", p.sharedCB)
+                    ExpertIOStats.recordGPU("routed", p.cb)
+                }
                 pending = nil
             }
         }
@@ -2744,6 +2760,15 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                                   outScale: cfg.embedOutScale)
         }
 
+        let prefetchGroup = DispatchGroup()
+        let tokenStart = ExpertIOStats.enabled ? DispatchTime.now().uptimeNanoseconds : 0
+        defer {
+            Self.waitGroup(prefetchGroup)
+            if ExpertIOStats.enabled {
+                ExpertIOStats.add("token-wall", Double(DispatchTime.now().uptimeNanoseconds - tokenStart) / 1e9)
+            }
+        }
+        var predicted: [Int] = []
         for L in 0..<cfg.numLayers {
             let isFull = cfg.fullAttentionLayerMask[L] != 0
             let inNorm = try model.inputNorm(layer: L)
@@ -2936,8 +2961,34 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                 perExpertScale: routerPerExpertOnes,
                 outIndices: outIndices, outWeights: outWeights,
                 numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts))
+            let predictNext = Self.qwenPrefetch && L + 1 < cfg.numLayers
+            if predictNext {
+                // Guess layer L+1's experts from the post-attention residual of L.
+                let nextNorm = try model.postAttnNorm(layer: L + 1)
+                let nextRouter = try model.router(layer: L + 1)
+                rms.encodeBF16W(commandBuffer: cb,
+                                x: hidden,
+                                weight: nextNorm.buffer, weightOffset: Int(nextNorm.offset),
+                                out: predNormed,
+                                d: D, eps: eps)
+                moe.encodeRouterGemma4(
+                    commandBuffer: cb,
+                    weights: nextRouter.buffer, weightsOffset: Int(nextRouter.offset),
+                    scales: nextRouter.buffer, scalesOffset: Int(nextRouter.scaleOffset),
+                    biases: nextRouter.buffer, biasesOffset: Int(nextRouter.biasOffset),
+                    hidden: predNormed,
+                    effectiveScale: effectiveScaleBuffers[L + 1],
+                    perExpertScale: routerPerExpertOnes,
+                    outIndices: predIndices, outWeights: predWeights,
+                    numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts))
+            }
             cb.commit()
+            let syncStart = ExpertIOStats.enabled ? DispatchTime.now().uptimeNanoseconds : 0
             waitUntilCompleted(cb)
+            if ExpertIOStats.enabled {
+                ExpertIOStats.recordSync(nanos: DispatchTime.now().uptimeNanoseconds - syncStart)
+                ExpertIOStats.recordGPU(isFull ? "cb1-full" : "cb1-gdn", cb)
+            }
             try drainPending(wait: false)
             try checkCommandBufferError(cb)
 
@@ -2979,7 +3030,29 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                 t: 1, d: D)
             sharedCB.commit()
 
+            let waitStart = ExpertIOStats.enabled ? DispatchTime.now().uptimeNanoseconds : 0
+            Self.waitGroup(prefetchGroup)
+            if ExpertIOStats.enabled {
+                ExpertIOStats.add("prefetch-wait", Double(DispatchTime.now().uptimeNanoseconds - waitStart) / 1e9)
+            }
+            if ExpertIOStats.enabled, !predicted.isEmpty {
+                ExpertIOStats.add("pred-hit", Double(experts.filter(predicted.contains).count))
+                ExpertIOStats.add("pred-total", Double(experts.count))
+            }
+            let fetchStart = ExpertIOStats.enabled ? DispatchTime.now().uptimeNanoseconds : 0
             let blobs = try await model.fetchRoutedExperts(layer: L, experts: experts)
+            if ExpertIOStats.enabled {
+                ExpertIOStats.add("fetch-wall", Double(DispatchTime.now().uptimeNanoseconds - fetchStart) / 1e9)
+            }
+            // Warm L+1's predicted experts while the GPU runs L's routed work and
+            // L+1's attention. Starting this before L's own fetch was slower: the
+            // two reads compete and L's fetch is on the critical path.
+            predicted = []
+            if predictNext {
+                let p = predIndices.contents().bindMemory(to: UInt32.self, capacity: cfg.topKExperts)
+                predicted = (0..<cfg.topKExperts).map { min(Int(p[$0]), cfg.numExperts - 1) }
+                try model.prefetchRoutedExperts(layer: L + 1, experts: predicted, group: prefetchGroup)
+            }
             let routedBufs = blobs.map { $0.buffer }
             let argBuf = moe.makeReusedRoutedArgumentBuffer(
                 routedBlobs: routedBufs, topK: topK)
@@ -3050,6 +3123,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
         // the fused greedy head).
         let fNorm = model.finalNorm
         let lm = model.lmHead
+        let headStart = ExpertIOStats.enabled ? DispatchTime.now().uptimeNanoseconds : 0
+        defer {
+            if ExpertIOStats.enabled {
+                ExpertIOStats.add("head-wall", Double(DispatchTime.now().uptimeNanoseconds - headStart) / 1e9)
+            }
+        }
 
         if emitHead {
             let useFusedHeadForThisToken = useFusedGreedyHead && outputMode == .greedyIfAvailable
