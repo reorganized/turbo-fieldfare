@@ -53,7 +53,21 @@ public enum SupportedModelSource {
         installedBytes: 19_600_000_000,
         reserveBytes: 2_147_483_648)
 
-    public static let all: [Entry] = [gemma4, qwen36]
+    /// Abliterated ("Heretic") derivative of `qwen36`. Its index.json is
+    /// byte-identical to the pinned 4-bit pack, so tensor layout, quant
+    /// overrides and shard ranges match; only weights and chat template differ.
+    public static let qwen36Heretic = Entry(
+        id: "qwen36heretic",
+        displayName: "Qwen3.6 35B-A3B Heretic Uncensored 4-bit",
+        repoID: "froggeric/Qwen3.6-35B-A3B-Uncensored-Heretic-MLX-4bit",
+        revision: "32939a6cef2750f18ccf352443f22f2e4dfe3613",
+        sourceIndexSHA256:
+            "0b28df60e33753a14e816d3b31577ae2c93884c58430a4a6de6ae9ea483842ea",
+        approximateDownloadBytes: 20_430_000_000,
+        installedBytes: 19_600_000_000,
+        reserveBytes: 2_147_483_648)
+
+    public static let all: [Entry] = [gemma4, qwen36, qwen36Heretic]
     public static let defaultEntry = gemma4
 
     public static func entry(id: String) -> Entry? {
