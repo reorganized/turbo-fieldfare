@@ -185,4 +185,17 @@ struct OpenAIRequestDecodingTests {
             Issue.record("decoding threw \(error) rather than a DecodingError")
         }
     }
+
+    @Test func chatTemplateKwargsEnableThinking() throws {
+        func thinking(_ fields: String) throws -> Bool {
+            try OpenAIRequestValidator.validate(try decode(request(fields)), modelID: "m")
+                .enableThinking
+        }
+        #expect(try thinking(#""stream":false"#))
+        #expect(try thinking(#""chat_template_kwargs":{}"#))
+        #expect(try thinking(#""chat_template_kwargs":{"enable_thinking":true}"#))
+        #expect(try !thinking(#""chat_template_kwargs":{"enable_thinking":false}"#))
+        #expect(validationRejection(request(#""chat_template_kwargs":{"enable_thinking":"no"}"#))?.param
+            == "chat_template_kwargs")
+    }
 }

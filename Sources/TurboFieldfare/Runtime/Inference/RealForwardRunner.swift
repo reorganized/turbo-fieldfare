@@ -527,6 +527,28 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
     public private(set) var totalHeadNanos: UInt64 = 0
     public private(set) var totalHeadFusedNanos: UInt64 = 0
     public private(set) var lastGreedyToken: UInt32 = 0
+
+    /// Interpretability read-out. When set, every prefill chunk appends the
+    /// dense-MLP input ([t, D] FP16) of `layers` and the greedy next token of
+    /// every row. Off (nil) on every normal path.
+    public final class ActivationCapture {
+        public let layers: Set<Int>
+        public var denseIn: [Int: Data] = [:]
+        public var argmax: [Int32] = []
+        private var staging: MTLBuffer?
+
+        public init(layers: Set<Int>) { self.layers = layers }
+
+        func stage(device: MTLDevice, bytes: Int) throws -> MTLBuffer {
+            if let staging, staging.length >= bytes { return staging }
+            guard let buffer = device.makeBuffer(length: bytes, options: .storageModeShared) else {
+                throw ModelError.residentBufferWrapFailed
+            }
+            staging = buffer
+            return buffer
+        }
+    }
+    public var activationCapture: ActivationCapture?
     public var usesFusedGreedyHead: Bool { useFusedGreedyHead }
     public private(set) var totalRDAdviseNanos: UInt64 = 0
     public private(set) var totalRDAdviseCalls: UInt64 = 0
@@ -1839,8 +1861,25 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                         topK: UInt32(cfg.topKExperts),
                         hiddenStrideElements: UInt32(D))
 
+                    let capturedBytes = t * D * MemoryLayout<Float16>.stride
+                    let captureStage = try activationCapture.flatMap { capture -> MTLBuffer? in
+                        guard capture.layers.contains(L) else { return nil }
+                        let stage = try capture.stage(device: ctx.device, bytes: capturedBytes)
+                        guard let blit = cb.makeBlitCommandEncoder() else {
+                            throw ModelError.residentBufferWrapFailed
+                        }
+                        blit.copy(from: scratch.denseX, sourceOffset: 0,
+                                  to: stage, destinationOffset: 0, size: capturedBytes)
+                        blit.endEncoding()
+                        return stage
+                    }
+
                     cb.commit()
                     try waitForCompletion(cb)
+                    if let captureStage {
+                        activationCapture?.denseIn[L, default: Data()]
+                            .append(Data(bytes: captureStage.contents(), count: capturedBytes))
+                    }
 
                     let routeCount = t * cfg.topKExperts
                     let idPtr = scratch.routeIDs.contents()
@@ -2137,6 +2176,51 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
             try waitForCompletion(finalCB)
             if outputMode == .greedyIfAvailable, useFusedGreedyHead {
                 lastGreedyToken = greedyTokenBuf.contents().load(as: UInt32.self)
+            }
+        }
+
+        if let capture = activationCapture {
+            // Greedy token after every row: final norm + tied head, a batch of
+            // rows per command buffer, argmax on the CPU. Softcap is monotonic.
+            let finalNorm = model.finalNorm
+            let lm = model.lmHead
+            let vocab = cfg.vocabSize
+            let rowsPerBatch = 32
+            let rowBytes = vocab * MemoryLayout<Float16>.stride
+            let stage = try capture.stage(device: ctx.device, bytes: rowsPerBatch * rowBytes)
+            for first in stride(from: 0, to: t, by: rowsPerBatch) {
+                let rows = min(rowsPerBatch, t - first)
+                guard let headCB = ctx.queue.makeCommandBuffer() else {
+                    throw ModelError.residentBufferWrapFailed
+                }
+                for r in 0..<rows {
+                    prefillFinalRowHead.encodeLogits(commandBuffer: headCB,
+                                                     hiddenBlock: scratch.hidden,
+                                                     row: first + r,
+                                                     rowStrideElements: D,
+                                                     normWeight: finalNorm.buffer,
+                                                     normWeightOffset: Int(finalNorm.offset),
+                                                     weights: lm.buffer,
+                                                     weightsOffset: Int(lm.offset),
+                                                     scales: lm.buffer,
+                                                     scalesOffset: Int(lm.scaleOffset),
+                                                     biases: lm.buffer,
+                                                     biasesOffset: Int(lm.biasOffset),
+                                                     logits: stage,
+                                                     logitsOffset: r * rowBytes,
+                                                     d: UInt32(D),
+                                                     vocab: UInt32(vocab),
+                                                     rmsEps: eps)
+                }
+                headCB.commit()
+                try waitForCompletion(headCB)
+                let values = stage.contents().bindMemory(to: Float16.self, capacity: rows * vocab)
+                for r in 0..<rows {
+                    let row = UnsafeBufferPointer(start: values + r * vocab, count: vocab)
+                    var best = 0
+                    for i in 1..<vocab where row[i] > row[best] { best = i }
+                    activationCapture?.argmax.append(Int32(best))
+                }
             }
         }
 
