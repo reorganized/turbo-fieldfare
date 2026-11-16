@@ -280,6 +280,13 @@ public protocol ServerInferenceBackend: Sendable {
                   onEvent: @escaping @Sendable (ServerInferenceEvent) -> Void) async throws -> ServerCompletion
     func activateModel(_ id: String) async throws
     func currentVisionCapability() async -> String
+    func activations(tokens: [Int32], layers: Set<Int>) async throws -> ServerActivations
+}
+
+public struct ServerActivations: Sendable {
+    /// Layer -> [tokens, hidden] FP16, little-endian.
+    public let layers: [Int: Data]
+    public let argmax: [Int32]
 }
 
 public extension ServerInferenceBackend {
@@ -290,6 +297,11 @@ public extension ServerInferenceBackend {
     func activateModel(_ id: String) async throws {}
 
     func currentVisionCapability() async -> String { "missing" }
+
+    func activations(tokens: [Int32], layers: Set<Int>) async throws -> ServerActivations {
+        throw ServerRequestError.invalid(message: "activations are not supported by this backend",
+                                         param: nil, code: "unsupported")
+    }
 
     func generate(
         _ prepared: ServerPreparedRequest,
@@ -808,6 +820,47 @@ public actor ServerModelSession: ServerInferenceBackend {
     private var promptCacheDomain: ServerPromptCacheDomain { loadedModel!.promptCacheDomain }
     private var visionRuntime: VisionRuntime? { loadedModel?.visionRuntime }
 
+    /// One cold prefill over `tokens` with the activation capture on. The
+    /// prompt cache and KV are dropped before and after, so later chat
+    /// answers are the same as if this request had never run.
+    public func activations(tokens: [Int32], layers: Set<Int>) async throws -> ServerActivations {
+        let config = model.config
+        guard tokens.count <= maxContext else {
+            throw ServerRequestError.invalid(
+                message: "\(tokens.count) tokens exceed max context \(maxContext)",
+                param: "tokens", code: "context_length_exceeded")
+        }
+        guard tokens.allSatisfy({ $0 >= 0 && Int($0) < config.vocabSize }) else {
+            throw ServerRequestError.invalid(message: "token id out of range",
+                                             param: "tokens", code: "invalid_tokens")
+        }
+        guard layers.allSatisfy({ (0..<config.numLayers).contains($0) }) else {
+            throw ServerRequestError.invalid(message: "layer out of range 0..<\(config.numLayers)",
+                                             param: "layers", code: "invalid_layers")
+        }
+        guard let logits = context.device.makeBuffer(
+            length: config.vocabSize * MemoryLayout<Float16>.size, options: .storageModeShared) else {
+            throw ModelError.residentBufferWrapFailed
+        }
+        let capture = RealForwardRunner.ActivationCapture(layers: layers)
+        promptCache.invalidate()
+        runner.reset()
+        runner.activationCapture = capture
+        defer {
+            runner.activationCapture = nil
+            promptCache.invalidate()
+            runner.reset()
+        }
+        _ = try await runner.prefillChunked(
+            tokens: tokens[...],
+            startPosition: 0,
+            outputMode: .logits,
+            config: .production(chunkTokens: runtimeConfiguration.prefillChunkTokens),
+            into: logits,
+            onProgress: { _ in })
+        return ServerActivations(layers: capture.denseIn, argmax: capture.argmax)
+    }
+
     public func generate(
         _ request: ValidatedChatRequest,
         onEvent: @escaping @Sendable (ServerInferenceEvent) -> Void
@@ -1037,7 +1090,7 @@ public actor ServerModelSession: ServerInferenceBackend {
         let renderedTextIDs: [Int32]? = isMultimodal
             ? nil : try (prepared.promptIDs ?? renderPrompt(request))
         var cacheMatch: ServerPromptCacheMatch = .miss
-        if promptCacheMode == .singlePrefix {
+        if promptCacheMode == .singlePrefix, request.enableThinking {
             cacheMatch = promptCache.match(
                 domain: promptCacheDomain,
                 request: request,
@@ -1242,7 +1295,7 @@ public actor ServerModelSession: ServerInferenceBackend {
         // image identity: a later turn whose images differ is refused by
         // `imagesDiverged` rather than resumed onto a KV built from a different
         // picture.
-        if promptCacheMode == .singlePrefix {
+        if promptCacheMode == .singlePrefix, request.enableThinking {
             promptCache.publish(
                 domain: promptCacheDomain,
                 request: request,
@@ -1269,9 +1322,11 @@ public actor ServerModelSession: ServerInferenceBackend {
         if usesToolTemplate(request) {
             promptIDs = try tokenizer.encodeToolChat(
                 messages: request.messages,
-                tools: request.tools)
+                tools: request.tools,
+                enableThinking: request.enableThinking)
         } else {
-            let rendered = try tokenizer.applyChatTemplate(request.messages)
+            let rendered = try tokenizer.applyChatTemplate(
+                request.messages, enableThinking: request.enableThinking)
             promptIDs = tokenizer.encode(rendered, addBOS: false)
         }
         guard promptIDs.count < maxContext else {

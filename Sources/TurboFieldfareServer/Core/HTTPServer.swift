@@ -177,6 +177,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
     }
 
     static let chatCompletionsPath = "/v1/chat/completions"
+    static let activationsPath = "/v1/activations"
 
     static func requestPath(_ head: HTTPRequestHead) -> String {
         head.uri.split(separator: "?", maxSplits: 1,
@@ -186,7 +187,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
 
     static func carriesChatBody(_ head: HTTPRequestHead) -> Bool {
         head.method == .POST
-            && requestPath(head) == chatCompletionsPath
+            && [chatCompletionsPath, activationsPath].contains(requestPath(head))
             && head.headers.first(name: "content-type")?
                 .lowercased().hasPrefix("application/json") == true
     }
@@ -321,7 +322,9 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                 return
             }
             handleCompletion(body: body, context: context)
-        case (_, "/health"), (_, "/v1/models"), (_, "/v1/chat/completions"):
+        case (.POST, Self.activationsPath):
+            handleActivations(body: body, context: context)
+        case (_, "/health"), (_, "/v1/models"), (_, "/v1/chat/completions"), (_, Self.activationsPath):
             writeError(context, status: .methodNotAllowed,
                        OpenAIErrorEnvelope(message: "method not allowed",
                                            code: "method_not_allowed"))
@@ -329,6 +332,69 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
             writeError(context, status: .notFound,
                        OpenAIErrorEnvelope(message: "route not found",
                                            code: "not_found"))
+        }
+    }
+
+    private struct ActivationsRequest: Decodable {
+        let tokens: [Int32]
+        let layers: [Int]
+        let site: String
+    }
+
+    /// Interpretability read-out: one prefill over `tokens`, returning the
+    /// dense-MLP input of the requested layers and the greedy next token
+    /// after every position. Runs through the coordinator like a chat turn.
+    private func handleActivations(body: ParsedChatRequestBody,
+                                   context: ChannelHandlerContext) {
+        guard let request = try? JSONDecoder().decode(ActivationsRequest.self, from: body.json) else {
+            writeError(context, status: .badRequest,
+                       OpenAIErrorEnvelope(message: "expected {tokens, layers, site}",
+                                           code: "invalid_json"))
+            return
+        }
+        guard request.site == "dense_in" else {
+            writeError(context, status: .badRequest,
+                       OpenAIErrorEnvelope(message: "site must be \"dense_in\"",
+                                           code: "invalid_site"))
+            return
+        }
+        guard !request.tokens.isEmpty, request.tokens.count <= 16384 else {
+            writeError(context, status: .badRequest,
+                       OpenAIErrorEnvelope(message: "tokens must hold 1...16384 ids",
+                                           code: "invalid_tokens"))
+            return
+        }
+        let contextBox = SendableContext(context)
+        inFlightRequests += 1
+        activeTask = childChannels.startTask {
+            defer {
+                contextBox.value.eventLoop.execute { self.inFlightRequests -= 1 }
+            }
+            do {
+                let result = try await self.coordinator.run {
+                    try await self.backend.activations(tokens: request.tokens,
+                                                       layers: Set(request.layers))
+                }
+                var layers: [String: Any] = [:]
+                for (layer, data) in result.layers {
+                    layers[String(layer)] = [
+                        "shape": [request.tokens.count, data.count / 2 / request.tokens.count],
+                        "dtype": "float16",
+                        "data": data.base64EncodedString(),
+                    ] as [String: Any]
+                }
+                self.writeJSON(contextBox.value, status: .ok, object: [
+                    "layers": layers,
+                    "argmax": result.argmax.map(Int.init),
+                ])
+            } catch let error as ServerRequestError {
+                self.writeError(contextBox.value, status: error.httpStatus, error.envelope)
+            } catch {
+                self.writeError(contextBox.value, status: .internalServerError,
+                                OpenAIErrorEnvelope(message: "activations failed: \(error)",
+                                                    code: "internal_error",
+                                                    type: "server_error"))
+            }
         }
     }
 

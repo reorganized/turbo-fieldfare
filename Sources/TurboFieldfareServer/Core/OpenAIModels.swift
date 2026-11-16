@@ -189,6 +189,9 @@ public struct OpenAIChatRequest: Codable, Equatable, Sendable {
     /// value of any other shape has to reach the validator as a request error
     /// rather than reading as malformed JSON.
     public let responseFormat: JSONValue?
+    /// vLLM/SGLang-style template options. Only `enable_thinking` is read
+    /// (Qwen); validation rejects a non-boolean value.
+    public let chatTemplateKwargs: JSONValue?
 
     enum CodingKeys: String, CodingKey {
         case model, messages, stream, temperature, stop, seed, tools, n, logprobs
@@ -203,6 +206,7 @@ public struct OpenAIChatRequest: Codable, Equatable, Sendable {
         case presencePenalty = "presence_penalty"
         case frequencyPenalty = "frequency_penalty"
         case responseFormat = "response_format"
+        case chatTemplateKwargs = "chat_template_kwargs"
     }
 
     /// Top-level keys accepted and ignored because they are caller-side
@@ -327,6 +331,8 @@ public struct OpenAIChatRequest: Codable, Equatable, Sendable {
             Float.self, forKey: .frequencyPenalty)
         responseFormat = try container.decodeIfPresent(
             JSONValue.self, forKey: .responseFormat)
+        chatTemplateKwargs = try container.decodeIfPresent(
+            JSONValue.self, forKey: .chatTemplateKwargs)
     }
 }
 
@@ -430,6 +436,9 @@ public struct ValidatedChatRequest: Sendable {
     public let includeUsage: Bool
     public let generationConfig: GenerationConfig
     public let maximumCompletionTokens: Int
+    /// Qwen only: false renders the template's empty think block instead of
+    /// opening one. Requests that leave it true are unchanged.
+    public var enableThinking = true
     /// Every staging directory this request's image files live in. The parser
     /// and the validator's store each stage under their own lease, and a
     /// request may carry files from both, so dropping either would delete
@@ -601,6 +610,25 @@ public enum OpenAIRequestValidator {
                           "invalid_value")
         }
 
+        var enableThinking = true
+        switch request.chatTemplateKwargs {
+        case nil, .null?:
+            break
+        case .object(let fields)?:
+            switch fields["enable_thinking"] {
+            case nil, .null?:
+                break
+            case .bool(let value)?:
+                enableThinking = value
+            default:
+                throw invalid("chat_template_kwargs.enable_thinking must be a boolean",
+                              "chat_template_kwargs", "invalid_value")
+            }
+        default:
+            throw invalid("chat_template_kwargs must be an object",
+                          "chat_template_kwargs", "invalid_value")
+        }
+
         let includeTools: Bool
         switch request.toolChoice {
         case nil, .some(.string("auto")):
@@ -627,7 +655,7 @@ public enum OpenAIRequestValidator {
                                       repetitionPenalty: repetitionPenalty,
                                       seed: request.seed,
                                       stopStrings: request.stop?.values ?? [])
-        return ValidatedChatRequest(messages: validatedMessages.messages,
+        var validated = ValidatedChatRequest(messages: validatedMessages.messages,
                                     multimodalMessages: validatedMessages.multimodal,
                                     imageFiles: validatedMessages.imageFiles,
                                     imageIdentities: validatedMessages.imageIdentities,
@@ -637,6 +665,8 @@ public enum OpenAIRequestValidator {
                                     generationConfig: config,
                                     maximumCompletionTokens: maximum,
                                     attachmentLeases: validatedMessages.leases)
+        validated.enableThinking = enableThinking
+        return validated
     }
 
     private static func validateTool(_ tool: OpenAITool) throws -> GFTokenizer.FunctionDefinition {

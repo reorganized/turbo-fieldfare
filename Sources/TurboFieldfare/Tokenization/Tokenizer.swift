@@ -435,7 +435,8 @@ public struct GFTokenizer: @unchecked Sendable {
     private static let turnClose   = "<turn|>"
     private static let bosMark     = "<bos>"
 
-    public func applyChatTemplate(_ messages: [Message]) throws -> String {
+    public func applyChatTemplate(_ messages: [Message],
+                                  enableThinking: Bool = true) throws -> String {
         if chatStyle == .qwenImStart {
             // Render through the installed chat_template.jinja sidecar
             // (add_generation_prompt; thinking enabled, so the prompt ends
@@ -472,7 +473,7 @@ public struct GFTokenizer: @unchecked Sendable {
                 truncation: false,
                 maxLength: nil,
                 tools: nil,
-                additionalContext: ["enable_thinking": true])
+                additionalContext: ["enable_thinking": enableThinking])
             return tokenizer.decode(tokens: renderedTokens, skipSpecialTokens: false)
         }
         var s = Self.bosMark
@@ -492,7 +493,8 @@ public struct GFTokenizer: @unchecked Sendable {
     }
 
     public func encodeToolChat(messages: [Message],
-                               tools: [FunctionDefinition]) throws -> [Int32] {
+                               tools: [FunctionDefinition],
+                               enableThinking: Bool = true) throws -> [Int32] {
         guard tokenizer.hasChatTemplate else {
             throw GFTokenizerError.missingToolTemplate
         }
@@ -536,7 +538,7 @@ public struct GFTokenizer: @unchecked Sendable {
             tools: upstreamTools,
             // Qwen always thinks; Gemma's tool template keeps its thought
             // channel closed as before.
-            additionalContext: ["enable_thinking": chatStyle == .qwenImStart]
+            additionalContext: ["enable_thinking": chatStyle == .qwenImStart && enableThinking]
         ).map(Int32.init)
     }
 
