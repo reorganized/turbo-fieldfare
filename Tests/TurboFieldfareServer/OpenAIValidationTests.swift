@@ -5,6 +5,16 @@ import Testing
 
 @Suite("OpenAI request validation")
 struct OpenAIValidationTests {
+    @Test func openCodeShapedLeadingGuidanceRendersAfterValidation() async throws {
+        let json = #"{"model":"m","stream":true,"messages":[{"role":"system","content":"You are a coding assistant."},{"role":"system","content":"Keep replies short."},{"role":"user","content":"Hi"}]}"#
+        let request = try JSONDecoder().decode(OpenAIChatRequest.self, from: Data(json.utf8))
+        let validated = try OpenAIRequestValidator.validate(request, modelID: "m")
+        let tokenizer = try await GFTokenizer.load()
+        let rendered = try tokenizer.applyChatTemplate(validated.messages)
+        #expect(rendered.hasPrefix("<bos><|turn>system\nYou are a coding assistant.<turn|>\n<|turn>system\nKeep replies short.<turn|>\n"))
+        #expect(tokenizer.encode(rendered, addBOS: false).filter { $0 == tokenizer.endOfTurnID }.count == 3)
+    }
+
     @Test func capturedOpenCodeInitialRequestValidates() throws {
         let request = try fixture("opencode-1.15.11-initial.json")
         let validated = try OpenAIRequestValidator.validate(
@@ -912,6 +922,13 @@ struct StreamingStopMatcherTests {
 
 @Suite("Server arguments")
 struct ServerArgumentTests {
+    @Test(arguments: [RuntimeEarlyExpertRead.off, .router])
+    func explicitPrefetchReachesRuntime(_ mode: RuntimeEarlyExpertRead) throws {
+        let args = try ServerArguments.parse([
+            "--model", "model.gturbo", "--early-expert-read", mode.rawValue,
+        ])
+        #expect(try args.resolvedRuntimeConfiguration().earlyExpertRead == mode)
+    }
 
     @Test(arguments: [24, 32])
     func cacheGrowthRejects128KOnEightGBUnlessExplicitlyOverridden(slots: Int) throws {
@@ -941,6 +958,8 @@ struct ServerArgumentTests {
         #expect(arguments.modelID == "gemma-4-26b-a4b-it")
         #expect(arguments.models == [.init(id: "gemma-4-26b-a4b-it",
                                            directory: "model.gturbo")])
+        #expect(arguments.earlyExpertRead == .off)
+        #expect(ServerArguments.usage.contains("off or router (default off)"))
     }
 
     @Test func repeatedModelRequiresMatchingModelIDs() throws {
@@ -1063,6 +1082,7 @@ struct ServerArgumentTests {
             "--prefill", "on",
             "--prefill-chunk-tokens", "64",
             "--rdadvise", "adaptive",
+            "--early-expert-read", "off",
         ])
         #expect(arguments.expertCacheSlots == 24)
         #expect(arguments.expertCachePolicy == .lru)
@@ -1076,6 +1096,7 @@ struct ServerArgumentTests {
         #expect(configuration.prefillPolicy == .chunked)
         #expect(configuration.prefillChunkTokens == 64)
         #expect(configuration.rdadvisePolicy == .adaptive)
+        #expect(configuration.earlyExpertRead == .off)
     }
 
     @Test func prefillOffIsResolvableBelowTheChunkedPrefillSlotFloor() throws {
@@ -1107,6 +1128,7 @@ struct ServerArgumentTests {
         ["--prefill-chunk-tokens", "512"],
         ["--prefill-chunk-tokens", "automatic"],
         ["--rdadvise", "eager"],
+        ["--early-expert-read", "next-layer"],
     ])
     func rejectsUnsupportedRuntimeValues(flag: [String]) throws {
         #expect(throws: ServerArgumentError.self) {
@@ -1302,6 +1324,7 @@ struct ServerArgumentTests {
                                         prefillPolicy: .off,
                                         prefillChunkTokens: 128,
                                         rdadvisePolicy: .off,
+                                        earlyExpertRead: .router,
                                         visionPack: nil,
                                         visionResidency: .onDemand),
              allowed: RuntimeConfiguration.allowedExpertCacheSlots,
@@ -1320,6 +1343,7 @@ struct ServerArgumentTests {
                                         prefillPolicy: .off,
                                         prefillChunkTokens: 512,
                                         rdadvisePolicy: .off,
+                                        earlyExpertRead: .router,
                                         visionPack: nil,
                                         visionResidency: .onDemand),
              allowed: RuntimeConfiguration.allowedPrefillChunkTokens,

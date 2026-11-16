@@ -3,9 +3,9 @@ import SwiftUI
 
 /// Chooses an installed `.gturbo` pack by directory.
 ///
-/// `AppModel.setModelURL` owns every switch mechanic (cancel in-flight work,
-/// rebind settings and history, re-probe); this only picks the directory. It
-/// disables itself mid-turn because `setModelURL` no-ops then — an offered
+/// `AppModel.reviewExistingModelLocation` owns every switch mechanic
+/// (validate, persist, rebind history, re-probe); this only picks the
+/// directory. It disables itself whenever that call would no-op — an offered
 /// control that silently does nothing is worse than a missing one.
 struct ModelChooserMenu: View {
     let model: AppModel
@@ -38,7 +38,7 @@ struct ModelChooserMenu: View {
             allowsMultipleSelection: false
         ) { result in
             guard case .success(let urls) = result, let url = urls.first else { return }
-            model.setModelURL(url)
+            Task { await model.reviewExistingModelLocation(url) }
         }
     }
 
@@ -53,9 +53,5 @@ struct ModelChooserMenu: View {
 }
 
 extension AppModel {
-    /// Switching mid-turn would be dropped by `setModelURL`'s guard anyway;
-    /// the control reflects that instead of lying about being usable.
-    public var canChooseModel: Bool {
-        !isTurnInFlight && !isInstallingModel && !isInstallingVisionPack
-    }
+    public var canChooseModel: Bool { canChangeModelLocation }
 }

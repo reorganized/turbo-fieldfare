@@ -89,6 +89,7 @@ public struct AppModelInstallRequirement: Equatable, Sendable {
 }
 
 public enum AppModelInstallReadiness: Equatable, Sendable {
+    case installed
     case checking
     case ready(AppModelInstallRequirement)
     case insufficientSpace(AppModelInstallRequirement)
@@ -98,7 +99,7 @@ public enum AppModelInstallReadiness: Equatable, Sendable {
         switch self {
         case .ready(let requirement), .insufficientSpace(let requirement):
             return requirement
-        case .checking, .failed:
+        case .installed, .checking, .failed:
             return nil
         }
     }
